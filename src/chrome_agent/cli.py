@@ -15,7 +15,7 @@ import sys
 
 
 # Operational commands -- checked first during routing
-OPERATIONAL_COMMANDS = {"launch", "status", "attach", "help", "cleanup", "stop", "guide", "completions"}
+OPERATIONAL_COMMANDS = {"launch", "profiles", "status", "attach", "help", "cleanup", "stop", "guide", "completions"}
 
 
 # Target-selection flags and the resolution each one forces. Bare --target maps
@@ -239,6 +239,8 @@ def _print_static_usage() -> None:
     print("Usage: chrome-agent <command> [args...]\n")
     print("Operational commands:")
     print("  launch [--port PORT] [--fingerprint PATH] [--headless] [--no-window-border] [-- CHROME_ARGS]  Launch Chrome")
+    print("         [--profile NAME | --profile-dir PATH]           Keep logins: use a persistent profile")
+    print("  profiles [list | path [NAME] | remove NAME --yes]      Manage persistent named profiles")
     print("  status [<instance>]                                    List instances and targets")
     print("  attach <instance> [+Event ...] [TARGET]                Attach for events")
     print("  help [<instance>] [Domain | Domain.method]             Protocol discovery")
@@ -266,6 +268,7 @@ def _print_static_usage() -> None:
     print()
     print("Examples:")
     print("  chrome-agent launch --headless")
+    print("  chrome-agent launch --profile work                      # logins survive stop and restart")
     print("  chrome-agent status")
     print("  chrome-agent attach mysite-01 +Page.loadEventFired")
     print("  chrome-agent mysite-01 Page.navigate '{\"url\": \"https://example.com\"}'")
@@ -276,7 +279,10 @@ def _print_static_usage() -> None:
 async def _run_launch(args: list[str]) -> None:
     """Launch a browser with CDP enabled."""
     from .launcher import BrowserNotFoundError, launch_browser
+    from .profiles import ProfileError
 
+    profile = None
+    profile_dir = None
     fingerprint_path = None
     headless = False
     port_override = None
@@ -290,6 +296,12 @@ async def _run_launch(args: list[str]) -> None:
             break
         elif args[i] == "--fingerprint" and i + 1 < len(args):
             fingerprint_path = args[i + 1]
+            i += 2
+        elif args[i] == "--profile" and i + 1 < len(args):
+            profile = args[i + 1]
+            i += 2
+        elif args[i] == "--profile-dir" and i + 1 < len(args):
+            profile_dir = args[i + 1]
             i += 2
         elif args[i] == "--headless":
             headless = True
@@ -315,23 +327,91 @@ async def _run_launch(args: list[str]) -> None:
             headless=headless,
             extra_args=extra_args,
             window_border=window_border,
+            profile=profile,
+            profile_dir=profile_dir,
         )
-    except (BrowserNotFoundError, RuntimeError, TimeoutError) as exc:
+    except (BrowserNotFoundError, ProfileError, RuntimeError, TimeoutError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if sys.stdout.isatty():
-        print(f"Browser launched: {result.name}")
+        print(f"Browser {'already running' if result.reused else 'launched'}: {result.name}")
         print(f"  Port:    {result.port}")
         print(f"  PID:     {result.pid}")
         print(f"  Version: {result.browser_version}")
+        if result.persistent:
+            print(f"  Profile: {result.profile or result.user_data_dir}")
     else:
-        print(json.dumps({
+        payload = {
             "name": result.name,
             "port": result.port,
             "pid": result.pid,
             "browser_version": result.browser_version,
-        }))
+        }
+        if result.persistent:
+            payload["profile"] = result.profile
+            payload["profile_dir"] = result.user_data_dir
+            payload["reused"] = result.reused
+        print(json.dumps(payload))
+
+
+def _run_profiles(args: list[str]) -> None:
+    """Manage persistent named profiles: list, path, remove."""
+    from .profiles import (
+        ProfileError,
+        launch_lock,
+        list_profiles,
+        profile_root,
+        remove_named,
+        resolve_named,
+        singleton_holder_pid,
+    )
+    from .registry import find_by_profile_dir
+    from .utils import process_is_running
+
+    action = args[0] if args else "list"
+    try:
+        if action == "list" and len(args) <= 1:
+            names = list_profiles()
+            if sys.stdout.isatty():
+                print("\n".join(names) if names else "No profiles. Create one with: chrome-agent launch --profile NAME")
+                return
+            rows = []
+            for name in names:
+                running = find_by_profile_dir(resolve_named(name, create=False).path)
+                rows.append({"name": name, "instance": running.name if running else None})
+            print(json.dumps(rows))
+        elif action == "path" and len(args) <= 2:
+            print(resolve_named(args[1], create=False).path if len(args) == 2 else profile_root())
+        elif action == "remove" and len(args) >= 2:
+            name = args[1]
+            if args[2:] != ["--yes"]:
+                print(
+                    f"Error: removing profile {name!r} deletes its logins and data. "
+                    f"Re-run with --yes to confirm: chrome-agent profiles remove {name} --yes",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            resolved = resolve_named(name, create=False)
+            with launch_lock(resolved.path):
+                running = find_by_profile_dir(resolved.path)
+                if running is not None:
+                    raise ProfileError(
+                        f"profile {name!r} is in use by instance {running.name}; stop it first"
+                    )
+                holder = singleton_holder_pid(resolved.path)
+                if holder is not None and process_is_running(pid=holder):
+                    raise ProfileError(
+                        f"profile {name!r} is in use by a browser (pid {holder}); close it first"
+                    )
+                remove_named(name)
+            print(f"Removed profile {name}")
+        else:
+            print("Usage: chrome-agent profiles [list | path [NAME] | remove NAME --yes]", file=sys.stderr)
+            sys.exit(1)
+    except ProfileError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _run_status(args: list[str]) -> None:
@@ -693,6 +773,8 @@ def main() -> None:
     if command in OPERATIONAL_COMMANDS:
         if command == "launch":
             asyncio.run(_run_launch(args=rest))
+        elif command == "profiles":
+            _run_profiles(rest)
         elif command == "status":
             _run_status(args=rest)
         elif command == "attach":

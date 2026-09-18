@@ -79,6 +79,8 @@ async def launch_browser(
     registry_path: str | None = None,
     extra_args: list[str] | None = None,
     window_border: bool = True,
+    profile: str | None = None,
+    profile_dir: str | None = None,
 ) -> InstanceInfo:
     """Launch Chrome with CDP enabled and register as a named instance.
 
@@ -87,16 +89,87 @@ async def launch_browser(
     ready, registers the instance in the registry, and optionally applies
     a fingerprint profile.
 
-    Session data is stored under /tmp/chrome-agent/session-<id>/.
+    Session data is stored under /tmp/chrome-agent/session-<id>/ and deleted
+    when the browser stops -- unless ``profile`` (a managed named profile) or
+    ``profile_dir`` (a caller-owned directory) asks for a persistent profile,
+    which no stop, exit, crash or cleanup path deletes. Launching a persistent
+    profile that a live instance already runs on returns that instance.
     The browser continues running after this function returns.
 
     Returns InstanceInfo with name, port, pid, browser_version, user_data_dir.
 
     Raises BrowserNotFoundError if Chrome is not installed.
+    Raises ProfileError if the persistent profile request is unsafe or the
+    profile is in use by a browser chrome-agent does not manage.
     Raises RuntimeError if no ports are available.
     Raises TimeoutError if the browser doesn't start within 30 seconds.
     """
 
+    # Phase 0: Resolve a persistent profile request before touching anything
+    resolved = _resolve_profile_request(
+        profile=profile, profile_dir=profile_dir, extra_args=extra_args,
+    )
+    if resolved is not None:
+        from .profiles import launch_lock
+        with launch_lock(resolved.path):
+            return await _launch_browser(
+                port_override=port_override, fingerprint=fingerprint,
+                headless=headless, pin_to_desktop=pin_to_desktop,
+                working_dir=working_dir, registry_path=registry_path,
+                extra_args=extra_args, window_border=window_border,
+                resolved=resolved,
+            )
+    return await _launch_browser(
+        port_override=port_override, fingerprint=fingerprint,
+        headless=headless, pin_to_desktop=pin_to_desktop,
+        working_dir=working_dir, registry_path=registry_path,
+        extra_args=extra_args, window_border=window_border,
+        resolved=None,
+    )
+
+
+def _resolve_profile_request(
+    profile: str | None,
+    profile_dir: str | None,
+    extra_args: list[str] | None,
+):
+    """Validate --profile / --profile-dir. Returns a ResolvedProfile or None."""
+    if profile is None and profile_dir is None:
+        return None
+    from .profiles import ProfileError, resolve_dir, resolve_named, _is_within
+
+    if profile is not None and profile_dir is not None:
+        raise ProfileError("use either --profile or --profile-dir, not both")
+    # Chrome honours the LAST --user-data-dir it is given, so a passthrough one
+    # would silently redirect the browser away from the profile we record,
+    # lock and protect.
+    for arg in extra_args or []:
+        if arg == "--user-data-dir" or arg.startswith("--user-data-dir="):
+            raise ProfileError(
+                "--user-data-dir cannot be combined with --profile/--profile-dir; "
+                "the profile option already selects the directory"
+            )
+    if profile is not None:
+        resolved = resolve_named(profile)
+        if _is_within(resolved.path, _SESSION_ROOT):
+            raise ProfileError(
+                f"the profile root is inside the temporary session root ({_SESSION_ROOT})"
+            )
+        return resolved
+    return resolve_dir(profile_dir, session_root=_SESSION_ROOT)
+
+
+async def _launch_browser(
+    port_override: int | None,
+    fingerprint: str | None,
+    headless: bool,
+    pin_to_desktop: bool,
+    working_dir: str | None,
+    registry_path: str | None,
+    extra_args: list[str] | None,
+    window_border: bool,
+    resolved,
+) -> InstanceInfo:
     # Phase 1: Find Chrome binary
     binary = find_chrome_binary()
     if binary is None:
@@ -110,6 +183,29 @@ async def launch_browser(
     # genuinely-gone browsers, and it frees their names/ports for reuse.
     cleanup_sessions(registry_path=registry_path)
 
+    # A persistent profile runs one browser at a time. If a live instance of
+    # ours already has it, hand that back (the caller asked for "a browser on
+    # this profile"). If Chrome's own lock shows another live process has it,
+    # refuse: launching would only forward to that process and exit.
+    if resolved is not None:
+        from .profiles import ProfileError, singleton_holder_pid
+        from .registry import find_by_profile_dir
+        existing = find_by_profile_dir(resolved.path, registry_path=registry_path)
+        if existing is not None:
+            if port_override is not None and port_override != existing.port:
+                raise ProfileError(
+                    f"profile is already running as {existing.name} on port "
+                    f"{existing.port}, not the requested port {port_override}"
+                )
+            existing.reused = True
+            return existing
+        holder = singleton_holder_pid(resolved.path)
+        if holder is not None and process_is_running(pid=holder):
+            raise ProfileError(
+                f"profile directory {resolved.path} is in use by a browser "
+                f"(pid {holder}) that chrome-agent does not manage"
+            )
+
     # Phase 2: Allocate port
     if port_override is not None:
         port = port_override
@@ -119,29 +215,42 @@ async def launch_browser(
         port = allocate_port(registry=registry_data)
 
     # Phase 3: Prepare launch arguments
-    os.makedirs(_SESSION_ROOT, exist_ok=True)
-    session_dir = tempfile.mkdtemp(prefix="session-", dir=_SESSION_ROOT)
+    if resolved is not None:
+        # Persistent: Chrome owns the directory. Write nothing into it -- no
+        # seeded Preferences -- and leave credential storage on the platform
+        # default so saved state stays readable across launches.
+        session_dir = resolved.path
+        args = [
+            binary,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={session_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+    else:
+        os.makedirs(_SESSION_ROOT, exist_ok=True)
+        session_dir = tempfile.mkdtemp(prefix="session-", dir=_SESSION_ROOT)
 
-    # Write Chrome preferences to disable password save prompts
-    default_dir = os.path.join(session_dir, "Default")
-    os.makedirs(default_dir, exist_ok=True)
-    prefs = {
-        "credentials_enable_service": False,
-        "profile": {
-            "password_manager_enabled": False,
-        },
-    }
-    with open(os.path.join(default_dir, "Preferences"), "w") as f:
-        json.dump(prefs, f)
+        # Write Chrome preferences to disable password save prompts
+        default_dir = os.path.join(session_dir, "Default")
+        os.makedirs(default_dir, exist_ok=True)
+        prefs = {
+            "credentials_enable_service": False,
+            "profile": {
+                "password_manager_enabled": False,
+            },
+        }
+        with open(os.path.join(default_dir, "Preferences"), "w") as f:
+            json.dump(prefs, f)
 
-    args = [
-        binary,
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={session_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--password-store=basic",
-    ]
+        args = [
+            binary,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={session_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--password-store=basic",
+        ]
     if headless:
         args.append("--headless=new")
     if extra_args:
@@ -207,6 +316,8 @@ async def launch_browser(
         port_override=port,
         registry_path=registry_path,
         pid_start=pid_start,
+        persistent=resolved is not None,
+        profile=resolved.name if resolved is not None else None,
     )
 
     # Phase 8: Spawn the per-instance supervisor (headed launches only). It is a

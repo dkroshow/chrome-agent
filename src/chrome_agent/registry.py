@@ -44,6 +44,14 @@ class InstanceInfo:
     user_data_dir: str = ""
     alive: bool = True
     pid_start: str | None = None
+    # Persistent launches (--profile / --profile-dir). ``user_data_dir`` is
+    # always the directory Chrome actually runs on; ``persistent`` marks it as
+    # one that stop, deregister and cleanup must never delete.
+    profile: str | None = None
+    persistent: bool = False
+    # True when a launch returned this already-running instance rather than
+    # starting a browser (persistent profiles run one browser at a time).
+    reused: bool = False
 
 
 class InstanceNotFoundError(Exception):
@@ -336,6 +344,57 @@ def allocate_port(registry: dict) -> int:
     raise RuntimeError(f"No available ports in range {BASE_PORT}-{MAX_PORT}")
 
 
+def _entry_browser_dir(entry: dict) -> str:
+    """The directory an entry's browser actually runs on."""
+    return entry.get("profile_dir") or entry.get("user_data_dir", "")
+
+
+def _entry_disposable_dir(entry: dict) -> str | None:
+    """The throwaway session directory an entry owns, or None.
+
+    The ONLY source of a path for the deletion code in this module. A
+    persistent entry owns no disposable directory, whatever else it records.
+    """
+    if entry.get("profile_dir"):
+        return None
+    return entry.get("user_data_dir") or None
+
+
+def _entry_info(name: str, entry: dict, alive: bool = True) -> InstanceInfo:
+    return InstanceInfo(
+        name=name,
+        port=entry["port"],
+        pid=entry["pid"],
+        browser_version=entry.get("browser_version", ""),
+        user_data_dir=_entry_browser_dir(entry),
+        alive=alive,
+        pid_start=entry.get("pid_start"),
+        profile=entry.get("profile"),
+        persistent=bool(entry.get("profile_dir")),
+    )
+
+
+def find_by_profile_dir(
+    profile_dir: str,
+    registry_path: str | None = None,
+) -> InstanceInfo | None:
+    """The live instance running on a persistent profile directory, if any."""
+    registry = _load_registry(_resolve_path(registry_path))
+    wanted = os.path.realpath(profile_dir)
+    for name, entry in registry.items():
+        recorded = entry.get("profile_dir")
+        if not recorded or os.path.realpath(recorded) != wanted:
+            continue
+        if _instance_is_alive(
+            entry["pid"],
+            entry["port"],
+            pid_start=entry.get("pid_start"),
+            user_data_dir=recorded,
+        ):
+            return _entry_info(name, entry)
+    return None
+
+
 def register(
     working_dir: str,
     pid: int,
@@ -344,11 +403,18 @@ def register(
     port_override: int | None = None,
     registry_path: str | None = None,
     pid_start: str | None = None,
+    persistent: bool = False,
+    profile: str | None = None,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
     Derives the instance name from working_dir basename.
     Auto-allocates a port unless port_override is specified.
+
+    A persistent instance records its directory under ``profile_dir`` and
+    leaves ``user_data_dir`` EMPTY. Every deletion path -- here and in older
+    chrome-agent versions sharing this registry file -- deletes only
+    ``user_data_dir``, so a persistent profile is never handed to one.
     """
     path = _resolve_path(registry_path)
     registry = _load_registry(path)
@@ -365,10 +431,13 @@ def register(
         "port": port,
         "pid": pid,
         "browser_version": browser_version,
-        "user_data_dir": user_data_dir,
+        "user_data_dir": "" if persistent else user_data_dir,
         "launched": datetime.now(timezone.utc).isoformat(),
         "pid_start": pid_start,
     }
+    if persistent:
+        registry[instance_name]["profile_dir"] = user_data_dir
+        registry[instance_name]["profile"] = profile
     _save_registry(registry, path)
 
     logger.info("Registered instance %s on port %d (pid %d)", instance_name, port, pid)
@@ -380,6 +449,8 @@ def register(
         browser_version=browser_version,
         user_data_dir=user_data_dir,
         pid_start=pid_start,
+        profile=profile,
+        persistent=persistent,
     )
 
 
@@ -406,18 +477,10 @@ def lookup(
         entry["pid"],
         entry["port"],
         pid_start=entry.get("pid_start"),
-        user_data_dir=entry.get("user_data_dir", ""),
+        user_data_dir=_entry_browser_dir(entry),
     )
 
-    return InstanceInfo(
-        name=instance_name,
-        port=entry["port"],
-        pid=entry["pid"],
-        browser_version=entry.get("browser_version", ""),
-        user_data_dir=entry.get("user_data_dir", ""),
-        alive=alive,
-        pid_start=entry.get("pid_start"),
-    )
+    return _entry_info(instance_name, entry, alive=alive)
 
 
 def enumerate_instances(
@@ -433,17 +496,9 @@ def enumerate_instances(
             entry["pid"],
             entry["port"],
             pid_start=entry.get("pid_start"),
-            user_data_dir=entry.get("user_data_dir", ""),
+            user_data_dir=_entry_browser_dir(entry),
         )
-        results.append(InstanceInfo(
-            name=name,
-            port=entry["port"],
-            pid=entry["pid"],
-            browser_version=entry.get("browser_version", ""),
-            user_data_dir=entry.get("user_data_dir", ""),
-            alive=alive,
-            pid_start=entry.get("pid_start"),
-        ))
+        results.append(_entry_info(name, entry, alive=alive))
     return results
 
 
@@ -525,7 +580,7 @@ def stop(
         registry = _load_registry(path)
         entry = registry.pop(instance_name, None)
         if entry:
-            session_dir = entry.get("user_data_dir")
+            session_dir = _entry_disposable_dir(entry)
             if session_dir and os.path.exists(session_dir):
                 shutil.rmtree(session_dir, ignore_errors=True)
         _save_registry(registry, path)
@@ -584,7 +639,7 @@ def stop(
         registry = _load_registry(path)
         entry = registry.pop(instance_name, None)
         if entry:
-            session_dir = entry.get("user_data_dir")
+            session_dir = _entry_disposable_dir(entry)
             if session_dir and os.path.exists(session_dir):
                 shutil.rmtree(session_dir, ignore_errors=True)
         _save_registry(registry, path)
@@ -630,7 +685,7 @@ def stop(
     registry = _load_registry(path)
     entry = registry.pop(instance_name, None)
     if entry:
-        session_dir = entry.get("user_data_dir")
+        session_dir = _entry_disposable_dir(entry)
         if session_dir and os.path.exists(session_dir):
             shutil.rmtree(session_dir, ignore_errors=True)
     _save_registry(registry, path)
@@ -678,7 +733,7 @@ def deregister(
     if entry is None:
         return False
     _save_registry(registry, path)
-    session_dir = entry.get("user_data_dir")
+    session_dir = _entry_disposable_dir(entry)
     if session_dir:
         _remove_session_dir(session_dir)
     logger.info("Deregistered instance %s (browser closed)", instance_name)
@@ -701,11 +756,11 @@ def cleanup(
             entry["pid"],
             entry["port"],
             pid_start=entry.get("pid_start"),
-            user_data_dir=entry.get("user_data_dir", ""),
+            user_data_dir=_entry_browser_dir(entry),
         ):
             del registry[name]
             removed.append(name)
-            session_dir = entry.get("user_data_dir")
+            session_dir = _entry_disposable_dir(entry)
             if session_dir and os.path.exists(session_dir):
                 shutil.rmtree(session_dir, ignore_errors=True)
             logger.info("Cleaned up stale instance %s", name)

@@ -40,6 +40,10 @@ class InstanceStatus:
     port: int
     alive: bool
     targets: list[PageTarget] = field(default_factory=list)
+    # Set for persistent launches: the managed profile name (--profile), and
+    # the directory the browser runs on (--profile or --profile-dir).
+    profile: str | None = None
+    profile_dir: str | None = None
 
 
 def query_targets(*, port: int) -> list[PageTarget]:
@@ -111,6 +115,8 @@ def get_instance_status(
             port=info.port,
             alive=info.alive,
             targets=targets,
+            profile=info.profile,
+            profile_dir=info.user_data_dir if info.persistent else None,
         ))
 
     return results
@@ -121,6 +127,10 @@ def format_status_text(statuses: list[InstanceStatus]) -> str:
     lines = []
     for status in statuses:
         header = f"{status.name}  port {status.port}"
+        if status.profile:
+            header += f"  profile {status.profile}"
+        elif status.profile_dir:
+            header += f"  profile-dir {status.profile_dir}"
         if not status.alive:
             header += "  DEAD"
         lines.append(header)
@@ -146,6 +156,8 @@ def format_status_json(statuses: list[InstanceStatus]) -> str:
             "name": status.name,
             "port": status.port,
             "alive": status.alive,
+            "profile": status.profile,
+            "profile_dir": status.profile_dir,
             "targets": [
                 {
                     "id": t.short_id,

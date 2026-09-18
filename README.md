@@ -192,6 +192,8 @@ An attach session **exits on its own once it has outlived its purpose** -- when 
 
 ```
 chrome-agent launch [--headless] [--fingerprint PATH] [--port PORT] [--no-window-border]
+                    [--profile NAME | --profile-dir PATH]
+chrome-agent profiles [list | path [NAME] | remove NAME --yes]
 chrome-agent status [<instance|glob>]
 chrome-agent attach <instance|glob> [+Event ...] [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
 chrome-agent stop <instance|glob> [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
@@ -204,6 +206,7 @@ chrome-agent --version
 | Command | Description |
 |---------|-------------|
 | `launch` | Find Chrome, launch with CDP enabled. Auto-allocates a port and names the instance from the current directory. |
+| `profiles` | Manage persistent named profiles: `list` them, print a `path`, or `remove NAME --yes`. See [Persistent Profiles](#persistent-profiles). |
 | `status` | List running instances with their page targets (IDs, URLs, titles). Accepts a glob to list a matching subset. |
 | `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab index, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. |
 | `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Accepts a glob, stopping every matching instance. Use `--target` or `--url` to close a single tab without affecting the browser; because this closes a tab, prefer the explicit `--target-id` / `--target-index`. |
@@ -215,6 +218,29 @@ chrome-agent --version
 Instances are tracked in a registry at `/tmp/chrome-agent/registry.json`. A headed browser's instance is **automatically removed from the registry when its window is closed** (its session directory is cleaned up too), so `status` reflects what is actually running. Liveness is determined by **process identity plus port attribution**, not a bare PID-existence check: the recorded PID counts only if it is a live process of the launching user whose start time matches what was recorded at launch (so a recycled or namespace-local PID never masquerades as the browser), and a listening CDP port counts only if a process claiming that port with this instance's profile directory can be found -- so browsers started via wrapper/snap launchers (which fork the real browser into another process) are still reported correctly, while a port since claimed by a *different* browser is not mistaken for this one. A **transient connection drop does not retire a live instance**: a host suspend/resume severs the supervisor's CDP connection while Chrome keeps running, so the supervisor reconnects and keeps supervising; retirement happens only once the CDP port stops listening. `cleanup` removes any entries that remain (headless instances, or browsers that were killed abruptly).
 
 Two consequences worth knowing. **Launching from inside a PID-namespaced sandbox** (a container, bubblewrap, some agent-CLI sandboxes) records the sandbox's local PID in the shared registry; the identity check recognizes such an entry as stale once its browser is gone, instead of treating the aliased host PID as a live browser forever. **`stop` verifies its target before acting**: it never sends `Browser.close` to a port that is serving a different browser (it terminates the instance's own verified process instead, or just cleans up the stale entry), and its SIGTERM fallback only ever fires at a PID verified to be the instance's own browser process.
+
+## Persistent Profiles
+
+By default every launch gets a throwaway Chrome profile that is deleted when the browser stops, so every launch starts logged out. A **persistent profile** keeps website sessions and installed extensions across stop, window close, crash and `cleanup`.
+
+```bash
+chrome-agent launch --profile work          # created on first use; reused afterwards
+# ... sign in to a site once, in the window ...
+chrome-agent stop myproject-01              # the profile stays
+chrome-agent launch --profile work          # still signed in
+
+chrome-agent profiles list
+chrome-agent profiles path work             # where it lives
+chrome-agent profiles remove work --yes     # the only command that deletes a profile
+```
+
+- **`--profile NAME`** uses a profile chrome-agent manages under a per-user, owner-only directory (`~/Library/Application Support/chrome-agent/profiles` on macOS, `$XDG_DATA_HOME/chrome-agent/profiles` on Linux, `%LOCALAPPDATA%\chrome-agent\profiles` on Windows; override with `CHROME_AGENT_PROFILE_ROOT`). Names are lowercase letters, digits, `.`, `_` and `-`. Use one profile per account context: sites that share a sign-in can share a profile; accounts that must not mix get separate profiles.
+- **`--profile-dir PATH`** uses a directory you own, anywhere. chrome-agent never deletes it -- not on `stop`, not on `cleanup`, and `profiles remove` does not apply to it. Refused: a symlink, another user's directory, your everyday Chrome profile, and anything under `/tmp/chrome-agent`.
+- **One browser per profile.** Launching a profile that is already running returns that instance (`"reused": true` in the JSON output) instead of starting a second browser. If a browser chrome-agent does not manage holds the profile, the launch is refused. `status` shows each instance's `profile` / `profile_dir`, so callers can select a browser by profile rather than by position.
+- **`profiles remove`** requires `--yes`, and refuses while any browser is using the profile.
+- A raw `-- --user-data-dir=...` cannot be combined with either option: Chrome honours the last one it is given, which would silently move the browser off the profile chrome-agent records and protects.
+
+**What it does and does not promise.** Persistence stops chrome-agent from destroying a session; the website still decides how long that session lasts, and can expire or revoke it. After a crash, only state Chrome had already written to disk survives. chrome-agent writes nothing into a persistent profile (no seeded preferences, no `--password-store=basic`), never reads or exports its contents, and a profile is not portable between machines. The advisory launch lock uses `flock`; on Windows only Chrome's own profile lock guards against a double launch. Tested on macOS; Linux and Windows paths follow platform conventions but have not been exercised.
 
 ## Interacting with Elements
 
