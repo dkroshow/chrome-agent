@@ -117,30 +117,36 @@ def _everyday_chrome_dirs() -> list[str]:
 
 
 def require_gui_session() -> None:
-    """On macOS, refuse a persistent launch from outside the desktop session.
+    """On macOS, refuse a persistent launch unless run from the desktop session.
 
     Chrome encrypts cookies with a key held in the login keychain. A process
     started outside the GUI ("Aqua") session -- over SSH, from some daemons --
-    cannot use that keychain, so Chrome cannot decrypt the profile's saved
-    sessions: the browser comes up signed out, and the saved logins may be
-    lost for good. Refusing is the only safe answer. LaunchAgents, Terminal
-    and desktop apps run inside the GUI session and are unaffected.
+    may be unable to use that keychain. Chrome then may not be able to decrypt
+    the profile's saved sessions: the browser can come up signed out, and
+    there is a risk the saved logins are lost. LaunchAgents, Terminal and
+    desktop apps run inside the GUI session.
+
+    Fails closed: anything other than a positive "Aqua" answer refuses,
+    including a missing or failing ``launchctl``. The override is explicit.
     """
     if sys.platform != "darwin" or os.environ.get(_ALLOW_NO_GUI_ENV) == "1":
         return
     try:
-        manager = subprocess.run(
+        result = subprocess.run(
             ["launchctl", "managername"], capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return
-    if manager and manager != "Aqua":
-        raise ProfileError(
-            f"refusing to open a persistent profile from a non-GUI macOS session "
-            f"({manager}): Chrome could not reach the login keychain here and the "
-            f"profile's saved logins could be lost. Launch from the desktop session "
-            f"(Terminal, a LaunchAgent), or set {_ALLOW_NO_GUI_ENV}=1 to override."
         )
+        manager = result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        manager = ""
+    if manager == "Aqua":
+        return
+    found = f"session type {manager!r}" if manager else "session type could not be determined"
+    raise ProfileError(
+        f"refusing to open a persistent profile outside the macOS desktop session "
+        f"({found}): Chrome may not reach the login keychain there, and the "
+        f"profile's saved logins would be at risk. Launch from the desktop session "
+        f"(Terminal, a LaunchAgent), or set {_ALLOW_NO_GUI_ENV}=1 to override."
+    )
 
 
 def resolve_named(name: str, create: bool = True) -> ResolvedProfile:

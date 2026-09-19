@@ -545,22 +545,32 @@ def test_explicit_port_already_serving_is_refused(isolated):
         _stop(isolated, first.name)
 
 
-def test_persistent_launch_refused_outside_macos_gui_session(isolated, monkeypatch):
-    """Over SSH Chrome cannot reach the keychain and saved logins can be lost."""
-    calls = []
-
+@pytest.mark.parametrize("stdout,returncode,raises", [
+    ("Aqua\n", 0, None), ("Background\n", 0, None), ("", 0, None), ("Aqua\n", 1, None),
+    ("", 0, FileNotFoundError), ("", 0, subprocess.TimeoutExpired),
+])
+def test_gui_session_guard_fails_closed(isolated, monkeypatch, stdout, returncode, raises):
+    """Only a positive 'Aqua' answer allows a persistent launch on macOS."""
     def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="Background\n", stderr="")
+        assert cmd == ["launchctl", "managername"]
+        if raises is subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(cmd, 5)
+        if raises:
+            raise raises()
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
 
     monkeypatch.setattr(profiles.sys, "platform", "darwin")
     monkeypatch.setattr(profiles.subprocess, "run", fake_run)
-    with pytest.raises(ProfileError, match="non-GUI macOS session"):
+    allowed = stdout.strip() == "Aqua" and returncode == 0 and raises is None
+    if allowed:
+        profiles.require_gui_session()
+        return
+    with pytest.raises(ProfileError, match="outside the macOS desktop session"):
         asyncio.run(launch_browser(
             headless=True, pin_to_desktop=False, registry_path=isolated["registry"], profile="ssh",
         ))
-    assert calls == [["launchctl", "managername"]]
-    assert not os.path.exists(os.path.join(isolated["root"], "ssh"))
-
+    # Refused before anything was created.
+    assert not os.path.exists(isolated["root"])
+    assert not os.path.exists(isolated["registry"])
     monkeypatch.setenv("CHROME_AGENT_ALLOW_NO_GUI_SESSION", "1")
-    profiles.require_gui_session()  # override: no refusal
+    profiles.require_gui_session()
