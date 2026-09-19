@@ -191,7 +191,7 @@ def list_profiles() -> list[str]:
     )
 
 
-def _lock_path(profile_path: str) -> str:
+def lock_path(profile_path: str) -> str:
     # Keyed on the resolved path so a named profile and a --profile-dir that
     # reach the same directory contend for one lock. Kept outside the profile:
     # chrome-agent writes nothing into a directory Chrome owns.
@@ -213,7 +213,7 @@ def launch_lock(profile_path: str):
     except ImportError:
         yield
         return
-    lock_file = _lock_path(profile_path)
+    lock_file = lock_path(profile_path)
     _make_private_dir(os.path.dirname(lock_file))
     fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
     try:

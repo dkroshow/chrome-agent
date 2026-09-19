@@ -209,6 +209,32 @@ def _save_registry(registry: dict, registry_path: str) -> None:
 
 
 @contextlib.contextmanager
+def _flock(lock_file: str):
+    """Exclusive advisory lock on ``lock_file``; a no-op without ``fcntl``."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def port_lock_path(registry_path: str) -> str:
+    """Lock file a launch holds from choosing its port until it is registered.
+
+    Separate from the registry lock (which ``register`` takes inside it), so
+    supervisors and ``stop`` are never blocked behind a browser starting up.
+    """
+    return registry_path + ".ports.lock"
+
+
+@contextlib.contextmanager
 def _registry_lock(registry_path: str):
     """Serialize one read-modify-write of the registry across processes.
 
@@ -219,18 +245,8 @@ def _registry_lock(registry_path: str):
     unique temp file still prevents a corrupt registry, but a concurrent
     writer's update can be lost.
     """
-    try:
-        import fcntl
-    except ImportError:
+    with _flock(registry_path + ".lock"):
         yield
-        return
-    os.makedirs(os.path.dirname(registry_path), exist_ok=True)
-    fd = os.open(registry_path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)
 
 
 def _pop_entry(instance_name: str, registry_path: str) -> dict | None:

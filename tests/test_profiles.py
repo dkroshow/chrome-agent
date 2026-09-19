@@ -27,6 +27,7 @@ from chrome_agent.registry import (
     cleanup,
     deregister,
     enumerate_instances,
+    instance_is_alive,
     lookup,
     register,
     stop,
@@ -480,3 +481,65 @@ def test_remove_refused_on_windows(isolated, monkeypatch):
     with pytest.raises(ProfileError, match="not supported on Windows"):
         profiles.remove_named("winprofile")
     assert os.path.isdir(resolved.path)
+
+
+_AUTO_PORT_CLI = """
+import sys
+from chrome_agent import cli, launcher, registry
+registry.REGISTRY_PATH = launcher.REGISTRY_PATH = sys.argv[1]
+launcher._SESSION_ROOT = sys.argv[2]
+registry.BASE_PORT, registry.MAX_PORT = 9353, 9358
+sys.argv = ["chrome-agent", "launch", "--headless", "--profile", sys.argv[3]]
+cli.main()
+"""
+
+
+@needs_chrome
+def test_concurrent_cli_launches_without_port_get_distinct_ports(isolated):
+    """Two real CLI launches at once, neither naming a port.
+
+    Both used to pick the same free port: the loser's Chrome failed to bind,
+    its readiness poll saw the winner's listener, and two profile names were
+    registered on one browser.
+    """
+    env = dict(os.environ, CHROME_AGENT_PROFILE_ROOT=isolated["root"])
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _AUTO_PORT_CLI, isolated["registry"],
+             isolated["session_root"], name],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            cwd=str(isolated["tmp"]),
+        )
+        for name in ("auto-a", "auto-b")
+    ]
+    results = [p.communicate(timeout=90) for p in procs]
+    launched = []
+    try:
+        assert [p.returncode for p in procs] == [0, 0], results
+        launched = [json.loads(out) for out, _ in results]
+        assert launched[0]["port"] != launched[1]["port"]
+        assert launched[0]["pid"] != launched[1]["pid"]
+        by_profile = {
+            i.profile: i for i in enumerate_instances(registry_path=isolated["registry"])
+        }
+        assert set(by_profile) == {"auto-a", "auto-b"}
+        for item in launched:
+            info = by_profile[item["profile"]]
+            assert (info.port, info.pid) == (item["port"], item["pid"])
+            # The browser on that port really runs on that profile's directory.
+            assert instance_is_alive(info)
+    finally:
+        for info in enumerate_instances(registry_path=isolated["registry"]):
+            _stop(isolated, info.name)
+
+
+@needs_chrome
+def test_explicit_port_already_serving_is_refused(isolated):
+    first = asyncio.run(_launch(isolated, PORT_A, profile="holder"))
+    try:
+        with pytest.raises(RuntimeError, match="already serving"):
+            asyncio.run(_launch(isolated, PORT_A, profile="intruder"))
+        names = [i.name for i in enumerate_instances(registry_path=isolated["registry"])]
+        assert names == [first.name]
+    finally:
+        _stop(isolated, first.name)

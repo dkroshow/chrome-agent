@@ -6,6 +6,7 @@ No Playwright dependency -- uses subprocess directly.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import tempfile
 
 from .connection import check_cdp_port
 from .registry import REGISTRY_PATH, InstanceInfo, allocate_port, register, cleanup
+from .registry import port_lock_path
 from .registry import _load_registry, _resolve_path
 from .utils import process_is_ours, process_is_running, process_start_time
 
@@ -110,8 +112,8 @@ async def launch_browser(
         profile=profile, profile_dir=profile_dir, extra_args=extra_args,
     )
     if resolved is not None:
-        from .profiles import launch_lock
-        with launch_lock(resolved.path):
+        from .profiles import lock_path
+        async with _async_flock(lock_path(resolved.path)):
             return await _launch_browser(
                 port_override=port_override, fingerprint=fingerprint,
                 headless=headless, pin_to_desktop=pin_to_desktop,
@@ -126,6 +128,33 @@ async def launch_browser(
         extra_args=extra_args, window_border=window_border,
         resolved=None,
     )
+
+
+@contextlib.asynccontextmanager
+async def _async_flock(lock_file: str):
+    """Exclusive advisory lock, acquired without blocking the event loop.
+
+    A blocking ``flock`` here would deadlock two launches running in one
+    process (``asyncio.gather``): the waiter would freeze the loop the holder
+    needs in order to finish. A no-op where ``fcntl`` is unavailable (Windows).
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    os.makedirs(os.path.dirname(lock_file), mode=0o700, exist_ok=True)
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _resolve_profile_request(
@@ -206,119 +235,131 @@ async def _launch_browser(
                 f"(pid {holder}) that chrome-agent does not manage"
             )
 
-    # Phase 2: Allocate port
-    if port_override is not None:
-        port = port_override
-    else:
-        reg_path = _resolve_path(registry_path)
-        registry_data = _load_registry(reg_path)
-        port = allocate_port(registry=registry_data)
+    # A port is chosen by looking at what is free *now*, but it only becomes
+    # visibly taken once Chrome listens on it and the instance is registered.
+    # Hold the port lock across that whole window: otherwise two concurrent
+    # launches pick the same port, the loser's Chrome fails to bind, its
+    # readiness poll sees the winner's listener, and two instance names end up
+    # routing to one browser -- for persistent profiles, to the wrong account.
+    async with _async_flock(port_lock_path(_resolve_path(registry_path))):
+        # Phase 2: Allocate port
+        if port_override is not None:
+            port = port_override
+            if check_cdp_port(port=port).listening:
+                raise RuntimeError(
+                    f"port {port} is already serving a browser; "
+                    "stop it or choose another port"
+                )
+        else:
+            reg_path = _resolve_path(registry_path)
+            registry_data = _load_registry(reg_path)
+            port = allocate_port(registry=registry_data)
 
-    # Phase 3: Prepare launch arguments
-    if resolved is not None:
-        # Persistent: Chrome owns the directory. Write nothing into it -- no
-        # seeded Preferences -- and leave credential storage on the platform
-        # default so saved state stays readable across launches.
-        session_dir = resolved.path
-        args = [
-            binary,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={session_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ]
-    else:
-        os.makedirs(_SESSION_ROOT, exist_ok=True)
-        session_dir = tempfile.mkdtemp(prefix="session-", dir=_SESSION_ROOT)
+        # Phase 3: Prepare launch arguments
+        if resolved is not None:
+            # Persistent: Chrome owns the directory. Write nothing into it -- no
+            # seeded Preferences -- and leave credential storage on the platform
+            # default so saved state stays readable across launches.
+            session_dir = resolved.path
+            args = [
+                binary,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={session_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+        else:
+            os.makedirs(_SESSION_ROOT, exist_ok=True)
+            session_dir = tempfile.mkdtemp(prefix="session-", dir=_SESSION_ROOT)
 
-        # Write Chrome preferences to disable password save prompts
-        default_dir = os.path.join(session_dir, "Default")
-        os.makedirs(default_dir, exist_ok=True)
-        prefs = {
-            "credentials_enable_service": False,
-            "profile": {
-                "password_manager_enabled": False,
-            },
-        }
-        with open(os.path.join(default_dir, "Preferences"), "w") as f:
-            json.dump(prefs, f)
+            # Write Chrome preferences to disable password save prompts
+            default_dir = os.path.join(session_dir, "Default")
+            os.makedirs(default_dir, exist_ok=True)
+            prefs = {
+                "credentials_enable_service": False,
+                "profile": {
+                    "password_manager_enabled": False,
+                },
+            }
+            with open(os.path.join(default_dir, "Preferences"), "w") as f:
+                json.dump(prefs, f)
 
-        args = [
-            binary,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={session_dir}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--password-store=basic",
-        ]
-    if headless:
-        args.append("--headless=new")
-    if extra_args:
-        args.extend(extra_args)
+            args = [
+                binary,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={session_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--password-store=basic",
+            ]
+        if headless:
+            args.append("--headless=new")
+        if extra_args:
+            args.extend(extra_args)
 
-    # Apply fingerprint via Chrome command-line flags (persistent)
-    env = os.environ.copy()
-    fp_profile = None
-    if fingerprint is not None:
-        from .fingerprint import load_fingerprint
-        fp_profile = load_fingerprint(path=fingerprint)
-        args.append(f"--user-agent={fp_profile.user_agent}")
-        args.append(f"--window-size={fp_profile.viewport['width']},{fp_profile.viewport['height']}")
-        args.append(f"--lang={fp_profile.locale}")
-        env["TZ"] = fp_profile.timezone
+        # Apply fingerprint via Chrome command-line flags (persistent)
+        env = os.environ.copy()
+        fp_profile = None
+        if fingerprint is not None:
+            from .fingerprint import load_fingerprint
+            fp_profile = load_fingerprint(path=fingerprint)
+            args.append(f"--user-agent={fp_profile.user_agent}")
+            args.append(f"--window-size={fp_profile.viewport['width']},{fp_profile.viewport['height']}")
+            args.append(f"--lang={fp_profile.locale}")
+            env["TZ"] = fp_profile.timezone
 
-    # Phase 4: Launch subprocess
-    process = subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-    # Capture the process's start-time identity token immediately, while the
-    # PID is guaranteed to still be this process (wrapper installs can exit
-    # fast). (pid, pid_start) lets liveness checks detect PID recycling.
-    pid_start = process_start_time(pid=process.pid)
-    logger.info("Launched Chrome PID %d on port %d", process.pid, port)
+        # Phase 4: Launch subprocess
+        process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        # Capture the process's start-time identity token immediately, while the
+        # PID is guaranteed to still be this process (wrapper installs can exit
+        # fast). (pid, pid_start) lets liveness checks detect PID recycling.
+        pid_start = process_start_time(pid=process.pid)
+        logger.info("Launched Chrome PID %d on port %d", process.pid, port)
 
-    # Phase 5: Wait for CDP port to be ready
-    deadline = asyncio.get_event_loop().time() + 30.0
-    status = None
-    while asyncio.get_event_loop().time() < deadline:
-        # Check if process died
-        if process.poll() is not None:
-            stderr_output = process.stderr.read().decode(errors="replace") if process.stderr else ""
-            raise RuntimeError(
-                f"Chrome exited immediately with code {process.returncode}. "
-                f"stderr: {stderr_output[:500]}"
-            )
-        status = check_cdp_port(port=port)
-        if status.listening:
-            break
-        await asyncio.sleep(0.2)
-    else:
-        # Timeout -- kill the process and fail
-        process.kill()
-        raise TimeoutError("Browser did not start within 30 seconds")
+        # Phase 5: Wait for CDP port to be ready
+        deadline = asyncio.get_event_loop().time() + 30.0
+        status = None
+        while asyncio.get_event_loop().time() < deadline:
+            # Check if process died
+            if process.poll() is not None:
+                stderr_output = process.stderr.read().decode(errors="replace") if process.stderr else ""
+                raise RuntimeError(
+                    f"Chrome exited immediately with code {process.returncode}. "
+                    f"stderr: {stderr_output[:500]}"
+                )
+            status = check_cdp_port(port=port)
+            if status.listening:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            # Timeout -- kill the process and fail
+            process.kill()
+            raise TimeoutError("Browser did not start within 30 seconds")
 
-    # Phase 6: Pin to desktop (Linux/X11, best-effort)
-    if pin_to_desktop and not headless:
-        await _move_to_launching_desktop(pid=process.pid)
+        # Phase 6: Pin to desktop (Linux/X11, best-effort)
+        if pin_to_desktop and not headless:
+            await _move_to_launching_desktop(pid=process.pid)
 
-    # Phase 7: Register in the instance registry
-    if working_dir is None:
-        working_dir = os.getcwd()
+        # Phase 7: Register in the instance registry
+        if working_dir is None:
+            working_dir = os.getcwd()
 
-    instance_info = register(
-        working_dir=working_dir,
-        pid=process.pid,
-        browser_version=status.browser_version or "unknown",
-        user_data_dir=session_dir,
-        port_override=port,
-        registry_path=registry_path,
-        pid_start=pid_start,
-        persistent=resolved is not None,
-        profile=resolved.name if resolved is not None else None,
-    )
+        instance_info = register(
+            working_dir=working_dir,
+            pid=process.pid,
+            browser_version=status.browser_version or "unknown",
+            user_data_dir=session_dir,
+            port_override=port,
+            registry_path=registry_path,
+            pid_start=pid_start,
+            persistent=resolved is not None,
+            profile=resolved.name if resolved is not None else None,
+        )
 
     # Phase 8: Spawn the per-instance supervisor (headed launches only). It is a
     # detached process -- it must survive the caller exiting (fire-and-forget
