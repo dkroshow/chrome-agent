@@ -15,7 +15,7 @@ import sys
 
 
 # Operational commands -- checked first during routing
-OPERATIONAL_COMMANDS = {"launch", "profiles", "status", "attach", "help", "cleanup", "stop", "guide", "completions"}
+OPERATIONAL_COMMANDS = {"launch", "profiles", "login", "login-check", "status", "attach", "help", "cleanup", "stop", "guide", "completions"}
 
 
 # Target-selection flags and the resolution each one forces. Bare --target maps
@@ -241,6 +241,9 @@ def _print_static_usage() -> None:
     print("  launch [--port PORT] [--fingerprint PATH] [--headless] [--no-window-border] [-- CHROME_ARGS]  Launch Chrome")
     print("         [--profile NAME | --profile-dir PATH]           Keep logins: use a persistent profile")
     print("  profiles [list | path [NAME] | remove NAME --yes]      Manage persistent named profiles")
+    print("  login-check (<instance> | --profile NAME | --profile-dir PATH) --site URL (--probe FILE | --probe-expr JS)")
+    print("                                                         Is the site signed in? exit 0 yes, 2 needs login, 3 error")
+    print("  login (same options) [--timeout SECONDS]               Open the site visibly; wait until a person has signed in")
     print("  status [<instance>]                                    List instances and targets")
     print("  attach <instance> [+Event ...] [TARGET]                Attach for events")
     print("  help [<instance>] [Domain | Domain.method]             Protocol discovery")
@@ -353,6 +356,87 @@ async def _run_launch(args: list[str]) -> None:
             payload["profile_dir"] = result.user_data_dir
             payload["reused"] = result.reused
         print(json.dumps(payload))
+
+
+async def _run_login(args: list[str], wait: bool) -> None:
+    """login-check / login: judge sign-in state with a caller-supplied probe."""
+    from .launcher import BrowserNotFoundError, launch_browser
+    from .login import ERROR, LoginResult, login_check, wait_for_login
+    from .profiles import ProfileError
+    from .registry import InstanceNotFoundError, resolve_instance_name, lookup, stop
+
+    command = "login" if wait else "login-check"
+    # --site, not --url: --url is already the global "pick the tab whose URL
+    # contains..." target selector and is consumed before command routing.
+    opts = {"--profile": None, "--profile-dir": None, "--site": None,
+            "--probe": None, "--probe-expr": None, "--timeout": None}
+    instance = None
+    i = 0
+    while i < len(args):
+        if args[i] in opts and i + 1 < len(args):
+            opts[args[i]] = args[i + 1]
+            i += 2
+        elif not args[i].startswith("-") and instance is None:
+            instance = args[i]
+            i += 1
+        else:
+            print(f"Error: unknown {command} option: {args[i]}", file=sys.stderr)
+            sys.exit(1)
+
+    def fail(message: str) -> None:
+        result = LoginResult(ERROR, url=opts["--site"] or "", detail={"reason": message})
+        print(result.to_json() if not sys.stdout.isatty() else f"error: {message}")
+        sys.exit(result.exit_code)
+
+    targets = [v for v in (instance, opts["--profile"], opts["--profile-dir"]) if v]
+    if len(targets) != 1:
+        fail("name exactly one of: <instance>, --profile NAME, --profile-dir PATH")
+    if not opts["--site"]:
+        fail("--site URL is required")
+    if bool(opts["--probe"]) == bool(opts["--probe-expr"]):
+        fail("give exactly one of --probe FILE or --probe-expr JS")
+    try:
+        probe = opts["--probe-expr"] or open(opts["--probe"]).read()
+        timeout = float(opts["--timeout"]) if opts["--timeout"] else (600.0 if wait else 30.0)
+    except (OSError, ValueError) as exc:
+        fail(str(exc))
+
+    launched_here = None
+    try:
+        if instance is not None:
+            info = lookup(resolve_instance_name(instance))
+            if not info.alive:
+                fail(f"instance {info.name} is not running")
+        else:
+            # A check on a profile nobody is running starts a headless browser
+            # and stops it again; waiting for a person needs a visible window.
+            info = await launch_browser(
+                headless=not wait, profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+            )
+            if not info.reused:
+                launched_here = info.name
+    except (InstanceNotFoundError, BrowserNotFoundError, ProfileError, RuntimeError, TimeoutError) as exc:
+        fail(str(exc))
+
+    if wait:
+        from .connection import check_cdp_port
+        if "Headless" in (check_cdp_port(port=info.port).browser_version or ""):
+            fail(f"instance {info.name} is headless, so nobody can sign in to it; stop it and run login again")
+        result = await wait_for_login(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
+    else:
+        result = await login_check(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
+    result.detail.setdefault("instance", info.name)
+
+    if launched_here and not wait:
+        # stop() drives its own event loop, so run it off this one.
+        await asyncio.to_thread(stop, launched_here)
+
+    if sys.stdout.isatty():
+        reason = result.detail.get("reason")
+        print(f"{result.status}: {result.url}" + (f" ({reason})" if reason else ""))
+    else:
+        print(result.to_json())
+    sys.exit(result.exit_code)
 
 
 def _run_profiles(args: list[str]) -> None:
@@ -775,6 +859,8 @@ def main() -> None:
             asyncio.run(_run_launch(args=rest))
         elif command == "profiles":
             _run_profiles(rest)
+        elif command in ("login", "login-check"):
+            asyncio.run(_run_login(rest, wait=command == "login"))
         elif command == "status":
             _run_status(args=rest)
         elif command == "attach":

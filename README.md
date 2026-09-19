@@ -194,6 +194,8 @@ An attach session **exits on its own once it has outlived its purpose** -- when 
 chrome-agent launch [--headless] [--fingerprint PATH] [--port PORT] [--no-window-border]
                     [--profile NAME | --profile-dir PATH]
 chrome-agent profiles [list | path [NAME] | remove NAME --yes]
+chrome-agent login-check (<instance> | --profile NAME | --profile-dir PATH) --site URL (--probe FILE | --probe-expr JS) [--timeout S]
+chrome-agent login       (same options; default timeout 600 s)
 chrome-agent status [<instance|glob>]
 chrome-agent attach <instance|glob> [+Event ...] [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
 chrome-agent stop <instance|glob> [--target SPEC | --target-id ID | --target-index N | --url SUBSTRING]
@@ -207,6 +209,7 @@ chrome-agent --version
 |---------|-------------|
 | `launch` | Find Chrome, launch with CDP enabled. Auto-allocates a port and names the instance from the current directory. |
 | `profiles` | Manage persistent named profiles: `list` them, print a `path`, or `remove NAME --yes`. See [Persistent Profiles](#persistent-profiles). |
+| `login-check` / `login` | Ask "is this browser signed in to the site?" with a probe you supply, or open the site and wait for a person to sign in. Exit `0` signed in, `2` needs a person, `3` error. See [Login Checks](#login-checks). |
 | `status` | List running instances with their page targets (IDs, URLs, titles). Accepts a glob to list a matching subset. |
 | `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab index, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. |
 | `stop` | Gracefully shut down a browser instance (`Browser.close`) or close a specific tab (`Target.closeTarget`). Accepts a glob, stopping every matching instance. Use `--target` or `--url` to close a single tab without affecting the browser; because this closes a tab, prefer the explicit `--target-id` / `--target-index`. |
@@ -243,6 +246,28 @@ chrome-agent profiles remove work --yes     # the only command that deletes a pr
 **What it does and does not promise.** Persistence stops chrome-agent from destroying a session; the website still decides how long that session lasts, and can expire or revoke it. After a crash, only state Chrome had already written to disk survives. chrome-agent writes nothing into a persistent profile (no seeded preferences, no `--password-store=basic`) and never reads or exports its authentication or browsing data; the only thing it reads there is the target of Chrome's `SingletonLock` (a host name and PID), to tell whether a browser is using the profile. A profile is not portable between machines.
 
 **Platform support.** Exercised on macOS. The Linux code paths follow the same POSIX model but have not been exercised. On Windows the guarantees are weaker: directory permissions and ownership are left to the platform's ACLs (no owner-only mode, no foreign-owner refusal), there is no launch lock or registry lock (`flock` is unavailable, so only Chrome's own profile lock guards a double launch, and concurrent launches can lose a registry update), a profile held by an unmanaged browser is not detected, and `profiles remove` is refused.
+
+## Login Checks
+
+A persistent profile keeps a session, but the website decides when it ends. `login-check` tells a script which state it is in before it does any work, and `login` is the one step that needs a person.
+
+```bash
+# probe.js -- runs in a page of the site; a small authenticated read is the most reliable signal
+#   fetch('/api/me').then(r => r.status === 200 ? 'ok' : 'needs_login')
+
+chrome-agent login-check --profile work --site https://app.example.com/ --probe probe.js
+# {"status": "needs_login", "url": "https://login.example.com/...", "reason": "redirected off site", ...}   exit 2
+
+chrome-agent login --profile work --site https://app.example.com/ --probe probe.js
+# opens a visible window; returns exit 0 as soon as the probe passes, exit 2 on timeout
+```
+
+- **The probe is yours.** chrome-agent knows nothing about any site. The probe is a JavaScript expression (promises are awaited) that returns `true`/`"ok"`, `false`/`"needs_login"`, or an object `{"status": "ok" | "needs_login" | "error", ...}`; extra keys are passed through to the JSON output. It can assert more than "signed in" -- for example that the page is the expected workspace -- and return `error` when it is not.
+- **Exit codes:** `0` signed in, `2` a person must sign in, `3` error (probe threw, timed out, browser not reachable, bad arguments).
+- **`login-check`** opens its own background tab, never activates a window, never touches a tab it did not open, and closes its tab afterwards. If the site redirects to another host (an identity provider), the answer is `needs_login` and the probe is not run there. Given `--profile`/`--profile-dir` for a profile that is not running, it starts a headless browser, checks, and stops it again.
+- **`login`** opens the site in a visible tab and polls only that tab, only while it is on the site's own host, so a sign-in ceremony on an identity provider's pages is never disturbed. It refuses a headless instance.
+- **Credentials.** These commands never read, store or log passwords, codes or cookies. A person signs in through the window. If a one-time code has to be relayed by an agent, type it with `Input.insertText` like any other input; keep it out of files and logs.
+- The target site is named with `--site` because `--url` is already the global tab selector.
 
 ## Interacting with Elements
 

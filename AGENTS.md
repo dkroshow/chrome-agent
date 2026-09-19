@@ -243,6 +243,8 @@ chrome-agent launch --headless            # no window (no border, no desktop pin
 chrome-agent launch --profile work        # persistent profile: logins survive stop/restart/cleanup; relaunch reuses the running instance
 chrome-agent launch --profile-dir ~/p/x   # same, on a directory you own (never deleted by chrome-agent)
 chrome-agent profiles list                # managed profiles; `profiles remove NAME --yes` is the only deletion
+chrome-agent login-check --profile work --site URL --probe probe.js   # exit 0 signed in / 2 needs a person / 3 error; own background tab, no focus
+chrome-agent login --profile work --site URL --probe probe.js         # visible window; returns when a person has signed in
 chrome-agent launch --fingerprint p.json  # spoof UA/viewport/lang/TZ via launch flags (also suppresses the marker)
 chrome-agent launch -- --some-chrome-flag # everything after -- passes through to Chrome
 chrome-agent status                       # all instances + their tabs
