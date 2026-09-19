@@ -83,7 +83,20 @@ class _Tab:
             method="Target.attachToTarget",
             params={"targetId": created["targetId"], "flatten": True},
         )
-        return cls(cdp, created["targetId"], attached["sessionId"])
+        tab = cls(cdp, created["targetId"], attached["sessionId"])
+        if background:
+            # A hidden tab is throttled: Chrome delays its timers by seconds,
+            # and sites defer work while `document.hidden`. Focus emulation
+            # makes this one tab report visible and focused. It is scoped to
+            # the tab and does not raise or activate any window.
+            try:
+                await cdp.send(
+                    method="Emulation.setFocusEmulationEnabled",
+                    params={"enabled": True}, session_id=tab.session_id,
+                )
+            except CDPError:
+                pass
+        return tab
 
     async def evaluate(self, expression: str, timeout: float):
         result = await asyncio.wait_for(
@@ -100,24 +113,38 @@ class _Tab:
             raise RuntimeError(text.splitlines()[0][:300])
         return result.get("result", {}).get("value")
 
-    async def wait_ready(self, timeout: float) -> str:
-        """Wait until the document has loaded; return the URL it settled on."""
-        deadline = asyncio.get_event_loop().time() + timeout
+    async def location(self) -> dict | None:
+        """{ready, url} of the tab now, or None while a navigation is in flight."""
+        try:
+            return await self.evaluate(
+                "({ready: document.readyState, url: location.href})", timeout=5,
+            )
+        except (CDPError, RuntimeError, asyncio.TimeoutError, TimeoutError):
+            # A navigation or redirect in flight destroys the execution
+            # context under the evaluation: the page is still loading.
+            return None
+
+    async def wait_settled(self, timeout: float, settle: float) -> str:
+        """Wait until the tab has stayed loaded on one URL for ``settle`` seconds.
+
+        "Loaded" alone is not enough: sites commonly finish loading and *then*
+        redirect to a sign-in page from script. Returns the settled URL.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        stable_url, stable_since = None, 0.0
         while True:
-            try:
-                state = await self.evaluate(
-                    "({ready: document.readyState, url: location.href})", timeout=5,
-                )
-            except (CDPError, RuntimeError, asyncio.TimeoutError, TimeoutError):
-                # A navigation or redirect in flight destroys the execution
-                # context under the evaluation. That is the page still
-                # loading, not a failure: ask again until the deadline.
-                state = None
-            if state and state["ready"] == "complete" and state["url"] != "about:blank":
-                return state["url"]
-            if asyncio.get_event_loop().time() > deadline:
-                raise TimeoutError("page did not finish loading")
-            await asyncio.sleep(0.25)
+            state = await self.location()
+            loaded = state and state["ready"] == "complete" and state["url"] != "about:blank"
+            if not loaded:
+                stable_url = None
+            elif state["url"] != stable_url:
+                stable_url, stable_since = state["url"], loop.time()
+            elif loop.time() - stable_since >= settle:
+                return stable_url
+            if loop.time() > deadline:
+                raise TimeoutError("page did not settle")
+            await asyncio.sleep(0.1)
 
     async def close(self) -> None:
         try:
@@ -126,22 +153,38 @@ class _Tab:
             pass
 
 
-async def _probe_tab(tab: _Tab, url: str, probe: str, timeout: float) -> LoginResult:
+async def _probe_tab(
+    tab: _Tab, url: str, probe: str, timeout: float, settle: float,
+) -> LoginResult:
+    off_site = {"reason": "redirected off site"}
     try:
-        landed = await tab.wait_ready(timeout=timeout)
+        landed = await tab.wait_settled(timeout=timeout, settle=settle)
         # Off the site's host means a sign-in redirect took over. The probe is
         # written for the site's own pages, so do not run it somewhere else.
         if not same_site(landed, url):
-            return LoginResult(NEEDS_LOGIN, url=landed, detail={"reason": "redirected off site"})
-        status, detail = classify(await tab.evaluate(probe, timeout=timeout))
-        return LoginResult(status, url=landed, detail=detail)
+            return LoginResult(NEEDS_LOGIN, url=landed, detail=off_site)
+        try:
+            outcome = classify(await tab.evaluate(probe, timeout=timeout))
+        except (TimeoutError, asyncio.TimeoutError):
+            raise
+        except Exception as exc:
+            outcome = (ERROR, {"reason": str(exc)[:300]})
+        # A redirect slower than the settle window can still pull the page
+        # away while the probe runs. Whatever the probe said then describes a
+        # page that was on its way out: where the tab is now decides.
+        after = await tab.wait_settled(timeout=timeout, settle=min(settle, 0.3))
+        if not same_site(after, url):
+            return LoginResult(NEEDS_LOGIN, url=after, detail=off_site)
+        return LoginResult(outcome[0], url=after, detail=outcome[1])
     except (TimeoutError, asyncio.TimeoutError):
         return LoginResult(ERROR, url=url, detail={"reason": "timed out"})
     except Exception as exc:
         return LoginResult(ERROR, url=url, detail={"reason": str(exc)[:300]})
 
 
-async def login_check(port: int, url: str, probe: str, timeout: float = 30.0) -> LoginResult:
+async def login_check(
+    port: int, url: str, probe: str, timeout: float = 30.0, settle: float = 1.0,
+) -> LoginResult:
     """Check sign-in state in a fresh background tab, then close that tab.
 
     Never touches a tab it did not open.
@@ -153,14 +196,14 @@ async def login_check(port: int, url: str, probe: str, timeout: float = 30.0) ->
     async with CDPClient(ws_url=ws_url) as cdp:
         tab = await _Tab.open(cdp, url=url, background=True)
         try:
-            return await _probe_tab(tab, url=url, probe=probe, timeout=timeout)
+            return await _probe_tab(tab, url=url, probe=probe, timeout=timeout, settle=settle)
         finally:
             await tab.close()
 
 
 async def wait_for_login(
     port: int, url: str, probe: str, timeout: float = 600.0,
-    poll_interval: float = 3.0, probe_timeout: float = 20.0,
+    poll_interval: float = 3.0, probe_timeout: float = 20.0, settle: float = 1.0,
 ) -> LoginResult:
     """Open the site in a visible tab and wait for a person to sign in.
 
@@ -178,7 +221,9 @@ async def wait_for_login(
         deadline = asyncio.get_event_loop().time() + timeout
         last = LoginResult(NEEDS_LOGIN, url=url)
         while asyncio.get_event_loop().time() < deadline:
-            last = await _probe_tab(tab, url=url, probe=probe, timeout=probe_timeout)
+            last = await _probe_tab(
+                tab, url=url, probe=probe, timeout=probe_timeout, settle=settle,
+            )
             if last.status == OK:
                 return last
             await asyncio.sleep(poll_interval)

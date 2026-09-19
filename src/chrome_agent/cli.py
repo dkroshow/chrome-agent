@@ -371,6 +371,7 @@ async def _run_login(args: list[str], wait: bool) -> None:
     opts = {"--profile": None, "--profile-dir": None, "--site": None,
             "--probe": None, "--probe-expr": None, "--timeout": None}
     instance = None
+    unknown = None
     i = 0
     while i < len(args):
         if args[i] in opts and i + 1 < len(args):
@@ -380,14 +381,16 @@ async def _run_login(args: list[str], wait: bool) -> None:
             instance = args[i]
             i += 1
         else:
-            print(f"Error: unknown {command} option: {args[i]}", file=sys.stderr)
-            sys.exit(1)
+            unknown = args[i]
+            break
 
     def fail(message: str) -> None:
         result = LoginResult(ERROR, url=opts["--site"] or "", detail={"reason": message})
         print(result.to_json() if not sys.stdout.isatty() else f"error: {message}")
         sys.exit(result.exit_code)
 
+    if unknown is not None:
+        fail(f"unknown {command} option: {unknown}")
     targets = [v for v in (instance, opts["--profile"], opts["--profile-dir"]) if v]
     if len(targets) != 1:
         fail("name exactly one of: <instance>, --profile NAME, --profile-dir PATH")
@@ -401,35 +404,50 @@ async def _run_login(args: list[str], wait: bool) -> None:
     except (OSError, ValueError) as exc:
         fail(str(exc))
 
-    launched_here = None
+    async def run(info) -> LoginResult:
+        if wait:
+            if info.headless:
+                fail(f"instance {info.name} is headless, so nobody can sign in to it; stop it and run login again")
+            return await wait_for_login(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
+        return await login_check(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
+
     try:
         if instance is not None:
             info = lookup(resolve_instance_name(instance))
             if not info.alive:
                 fail(f"instance {info.name} is not running")
+            result = await run(info)
         else:
             # A check on a profile nobody is running starts a headless browser
             # and stops it again; waiting for a person needs a visible window.
-            info = await launch_browser(
-                headless=not wait, profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+            # The use lock makes that start-check-stop one unit per profile:
+            # without it a second check reuses the first one's browser and has
+            # it stopped underneath it.
+            from .launcher import _SESSION_ROOT, _async_flock
+            from .profiles import lock_path, resolve_dir, resolve_named
+            resolved = (
+                resolve_named(opts["--profile"]) if opts["--profile"]
+                else resolve_dir(opts["--profile-dir"], session_root=_SESSION_ROOT)
             )
-            if not info.reused:
-                launched_here = info.name
+            use_lock = _async_flock(lock_path(resolved.path) + ".use")
+            if wait:
+                async with use_lock:
+                    info = await launch_browser(
+                        profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+                    )
+                result = await run(info)
+            else:
+                async with use_lock:
+                    info = await launch_browser(
+                        headless=True, profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+                    )
+                    result = await run(info)
+                    if not info.reused and not _has_open_pages(info.port):
+                        # stop() drives its own event loop, so run it off this one.
+                        await asyncio.to_thread(stop, info.name)
     except (InstanceNotFoundError, BrowserNotFoundError, ProfileError, RuntimeError, TimeoutError) as exc:
         fail(str(exc))
-
-    if wait:
-        from .connection import check_cdp_port
-        if "Headless" in (check_cdp_port(port=info.port).browser_version or ""):
-            fail(f"instance {info.name} is headless, so nobody can sign in to it; stop it and run login again")
-        result = await wait_for_login(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
-    else:
-        result = await login_check(port=info.port, url=opts["--site"], probe=probe, timeout=timeout)
     result.detail.setdefault("instance", info.name)
-
-    if launched_here and not wait:
-        # stop() drives its own event loop, so run it off this one.
-        await asyncio.to_thread(stop, launched_here)
 
     if sys.stdout.isatty():
         reason = result.detail.get("reason")
@@ -437,6 +455,23 @@ async def _run_login(args: list[str], wait: bool) -> None:
     else:
         print(result.to_json())
     sys.exit(result.exit_code)
+
+
+def _has_open_pages(port: int) -> bool:
+    """Whether anyone has opened a real page in this browser.
+
+    Guards the stop after a check: if something else launched this profile in
+    the meantime it got this same browser back, and is now using it.
+    """
+    from .cdp_client import get_targets
+    try:
+        targets = get_targets(port=port)
+    except ConnectionError:
+        return False
+    return any(
+        t.get("type") == "page" and t.get("url", "").startswith(("http://", "https://", "file://"))
+        for t in targets
+    )
 
 
 def _run_profiles(args: list[str]) -> None:

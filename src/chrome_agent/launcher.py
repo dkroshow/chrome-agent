@@ -357,6 +357,7 @@ async def _launch_browser(
             port_override=port,
             registry_path=registry_path,
             pid_start=pid_start,
+            headless=headless,
             persistent=resolved is not None,
             profile=resolved.name if resolved is not None else None,
         )

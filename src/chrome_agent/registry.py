@@ -54,6 +54,9 @@ class InstanceInfo:
     # True when a launch returned this already-running instance rather than
     # starting a browser (persistent profiles run one browser at a time).
     reused: bool = False
+    # Recorded at launch. Chrome's new headless mode reports an ordinary
+    # version string, so this cannot be recovered from the browser later.
+    headless: bool = False
 
 
 class InstanceNotFoundError(Exception):
@@ -436,6 +439,7 @@ def _entry_info(name: str, entry: dict, alive: bool = True) -> InstanceInfo:
         pid_start=entry.get("pid_start"),
         profile=entry.get("profile"),
         persistent=bool(entry.get("profile_dir")),
+        headless=bool(entry.get("headless")),
     )
 
 
@@ -470,6 +474,7 @@ def register(
     pid_start: str | None = None,
     persistent: bool = False,
     profile: str | None = None,
+    headless: bool = False,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
@@ -481,7 +486,7 @@ def register(
             working_dir=working_dir, pid=pid, browser_version=browser_version,
             user_data_dir=user_data_dir, port_override=port_override,
             registry_path=registry_path, pid_start=pid_start,
-            persistent=persistent, profile=profile,
+            persistent=persistent, profile=profile, headless=headless,
         )
 
 
@@ -495,6 +500,7 @@ def _register_locked(
     pid_start: str | None = None,
     persistent: bool = False,
     profile: str | None = None,
+    headless: bool = False,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
@@ -525,6 +531,8 @@ def _register_locked(
         "launched": datetime.now(timezone.utc).isoformat(),
         "pid_start": pid_start,
     }
+    if headless:
+        registry[instance_name]["headless"] = True
     if persistent:
         registry[instance_name]["profile_dir"] = user_data_dir
         registry[instance_name]["profile"] = profile
@@ -541,6 +549,7 @@ def _register_locked(
         pid_start=pid_start,
         profile=profile,
         persistent=persistent,
+        headless=headless,
     )
 
 
