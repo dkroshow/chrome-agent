@@ -422,3 +422,61 @@ def test_remove_refuses_profile_held_by_live_browser(isolated):
     result = _cli(isolated, "profiles", "remove", "held", "--yes")
     assert result.returncode == 1 and "in use" in result.stderr
     assert os.path.isdir(resolved.path)
+
+
+# ---------------------------------------------------------------------------
+# Registry writes are process-safe
+# ---------------------------------------------------------------------------
+
+_REGISTER_SNIPPET = """
+import sys
+from chrome_agent.registry import register
+register(working_dir="/home/user/race", pid=int(sys.argv[2]), browser_version="t",
+         user_data_dir="", port_override=int(sys.argv[2]), registry_path=sys.argv[1],
+         persistent=True, profile="p" + sys.argv[2])
+"""
+
+
+def test_concurrent_registers_lose_nothing(isolated):
+    """Many processes registering at once: every entry lands, none crashes."""
+    count = 12
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", _REGISTER_SNIPPET, isolated["registry"], str(20000 + i)],
+            stderr=subprocess.PIPE,
+        )
+        for i in range(count)
+    ]
+    errors = [p.communicate()[1].decode() for p in procs]
+    assert [p.returncode for p in procs] == [0] * count, errors
+    registry = _load_registry(isolated["registry"])
+    assert len(registry) == count
+    assert sorted(e["port"] for e in registry.values()) == [20000 + i for i in range(count)]
+    leftovers = [f for f in os.listdir(isolated["tmp"]) if f.endswith(".tmp")]
+    assert leftovers == []
+
+
+@needs_chrome
+def test_concurrent_cli_style_launches_of_two_profiles(isolated):
+    """Two different profiles launched at the same moment both get registered."""
+    async def both():
+        return await asyncio.gather(
+            _launch(isolated, PORT_A, profile="race-a"),
+            _launch(isolated, PORT_B, profile="race-b"),
+        )
+
+    a, b = asyncio.run(both())
+    try:
+        names = {i.name for i in enumerate_instances(registry_path=isolated["registry"])}
+        assert {a.name, b.name} <= names and a.name != b.name
+    finally:
+        _stop(isolated, a.name)
+        _stop(isolated, b.name)
+
+
+def test_remove_refused_on_windows(isolated, monkeypatch):
+    resolved = profiles.resolve_named("winprofile")
+    monkeypatch.setattr(profiles.sys, "platform", "win32")
+    with pytest.raises(ProfileError, match="not supported on Windows"):
+        profiles.remove_named("winprofile")
+    assert os.path.isdir(resolved.path)

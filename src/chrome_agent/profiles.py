@@ -11,7 +11,9 @@ and cleanup. There are two ways to ask for one:
   and never deletes it, under any command.
 
 Chrome owns everything inside the directory. chrome-agent never reads, copies
-or exports its contents.
+or exports authentication or browsing data. The one thing it reads is the
+target of Chrome's ``SingletonLock`` (a host name and PID), to tell whether a
+browser is using the profile.
 """
 
 import contextlib
@@ -243,7 +245,18 @@ def remove_named(name: str) -> str:
 
     The caller must already hold ``launch_lock`` for the profile and have
     established that no browser is using it. Returns the removed path.
+
+    Refused on Windows: there the launch lock is a no-op and Chrome's profile
+    lock is not the readable symlink it is on POSIX, so "no browser is using
+    it" cannot be established. Deleting under a running browser would remove
+    part of a profile before a locked file stopped it.
     """
+    if sys.platform == "win32":
+        raise ProfileError(
+            "profiles remove is not supported on Windows: chrome-agent cannot "
+            "verify the profile is idle. Close the browser and delete "
+            f"{os.path.join(profile_root(), name)} yourself."
+        )
     resolved = resolve_named(name, create=False)
     shutil.rmtree(resolved.path)
     return resolved.path
