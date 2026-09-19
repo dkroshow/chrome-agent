@@ -258,6 +258,18 @@ def test_concurrent_cli_checks_on_one_stopped_profile(cli, site):
     assert json.loads(open(cli.registry).read()) == {}
 
 
+def test_repeated_concurrent_checks_never_leave_a_browser(cli, site):
+    """Whichever check runs last stops the browser: nothing stays registered."""
+    for _ in range(4):
+        procs = [
+            cli.start("login-check", "--profile", "shared", "--site", f"{site}/app", "--probe-expr", PROBE)
+            for _ in range(3)
+        ]
+        results = [p.communicate(timeout=120) for p in procs]
+        assert [p.returncode for p in procs] == [2, 2, 2], results
+        assert json.loads(open(cli.registry).read()) == {}
+
+
 def test_cli_login_refuses_headless_instance(cli, site):
     launched = json.loads(cli("launch", "--headless", "--profile", "hidden").stdout)
     result = cli("login", "--profile", "hidden", "--site", f"{site}/app",
@@ -265,5 +277,12 @@ def test_cli_login_refuses_headless_instance(cli, site):
     assert result.returncode == 3 and "headless" in json.loads(result.stdout)["reason"]
     by_name = cli("login", launched["name"], "--site", f"{site}/app", "--probe-expr", "true")
     assert by_name.returncode == 3
+    # An entry written by an older build has no headless field: still refused.
+    registry = json.loads(open(cli.registry).read())
+    del registry[launched["name"]]["headless"]
+    open(cli.registry, "w").write(json.dumps(registry))
+    legacy = cli("login", "--profile", "hidden", "--site", f"{site}/app",
+                 "--probe-expr", "true", "--timeout", "5")
+    assert legacy.returncode == 3 and "headless" in json.loads(legacy.stdout)["reason"]
     # The refusal left the running browser alone.
     assert launched["name"] in json.loads(open(cli.registry).read())

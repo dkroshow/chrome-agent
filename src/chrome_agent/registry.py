@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -428,6 +429,27 @@ def _entry_disposable_dir(entry: dict) -> str | None:
     return entry.get("user_data_dir") or None
 
 
+def _entry_is_headless(entry: dict) -> bool:
+    """Whether an entry's browser was launched headless.
+
+    Entries written by this build always carry the answer. One written by an
+    older build does not, and the browser itself will not say (Chrome's new
+    headless mode reports an ordinary version string), so fall back to the
+    recorded process's command line. Best effort: no answer on Windows, or
+    when a wrapper launcher exited and the real browser runs under another PID.
+    """
+    if "headless" in entry:
+        return bool(entry["headless"])
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(entry["pid"])],
+            capture_output=True, text=True, timeout=2,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(arg == "--headless" or arg.startswith("--headless=") for arg in out.split())
+
+
 def _entry_info(name: str, entry: dict, alive: bool = True) -> InstanceInfo:
     return InstanceInfo(
         name=name,
@@ -439,7 +461,7 @@ def _entry_info(name: str, entry: dict, alive: bool = True) -> InstanceInfo:
         pid_start=entry.get("pid_start"),
         profile=entry.get("profile"),
         persistent=bool(entry.get("profile_dir")),
-        headless=bool(entry.get("headless")),
+        headless=_entry_is_headless(entry),
     )
 
 
@@ -531,8 +553,7 @@ def _register_locked(
         "launched": datetime.now(timezone.utc).isoformat(),
         "pid_start": pid_start,
     }
-    if headless:
-        registry[instance_name]["headless"] = True
+    registry[instance_name]["headless"] = headless
     if persistent:
         registry[instance_name]["profile_dir"] = user_data_dir
         registry[instance_name]["profile"] = profile

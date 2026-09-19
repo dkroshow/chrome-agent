@@ -147,8 +147,18 @@ class _Tab:
             await asyncio.sleep(0.1)
 
     async def close(self) -> None:
+        """Close the tab and wait until Chrome has actually retired it.
+
+        ``Target.closeTarget`` returns before the target is gone. A caller
+        that looks at the browser's tabs next must not still see this one.
+        """
         try:
             await self.cdp.send(method="Target.closeTarget", params={"targetId": self.target_id})
+            for _ in range(40):
+                listed = await self.cdp.send(method="Target.getTargets")
+                if all(t["targetId"] != self.target_id for t in listed["targetInfos"]):
+                    return
+                await asyncio.sleep(0.05)
         except Exception:
             pass
 
