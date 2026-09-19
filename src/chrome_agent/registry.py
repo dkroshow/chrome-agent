@@ -9,6 +9,7 @@ All public functions accept an optional registry_path parameter for test
 isolation.
 """
 
+import contextlib
 import fnmatch
 import json
 import logging
@@ -16,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -186,12 +188,59 @@ def _load_registry(registry_path: str) -> dict:
 
 
 def _save_registry(registry: dict, registry_path: str) -> None:
-    """Save the registry atomically via temp-file-and-rename."""
+    """Save the registry atomically via temp-file-and-rename.
+
+    The temp file is unique per writer: two processes saving at once must not
+    share one temp path, or one renames the other's file out from under it.
+    """
+    directory = os.path.dirname(registry_path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(registry_path) + ".", suffix=".tmp", dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(registry, f, indent=2)
+        os.replace(tmp_path, registry_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
+@contextlib.contextmanager
+def _registry_lock(registry_path: str):
+    """Serialize one read-modify-write of the registry across processes.
+
+    Every writer loads the whole file, edits it and writes it back, so two
+    concurrent writers (two launches, a launch and a supervisor retirement)
+    would otherwise each save a copy missing the other's change. Advisory
+    ``flock`` on a sidecar file; where ``fcntl`` is unavailable (Windows) the
+    unique temp file still prevents a corrupt registry, but a concurrent
+    writer's update can be lost.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
     os.makedirs(os.path.dirname(registry_path), exist_ok=True)
-    tmp_path = registry_path + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(registry, f, indent=2)
-    os.rename(tmp_path, registry_path)
+    fd = os.open(registry_path + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _pop_entry(instance_name: str, registry_path: str) -> dict | None:
+    """Remove one entry from the registry under the lock; return it, if any."""
+    with _registry_lock(registry_path):
+        registry = _load_registry(registry_path)
+        entry = registry.pop(instance_name, None)
+        if entry is not None:
+            _save_registry(registry, registry_path)
+    return entry
 
 
 def _port_is_listening(port: int) -> bool:
@@ -408,6 +457,31 @@ def register(
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
+    Name derivation, port allocation and the write happen under the registry
+    lock, so concurrent launches get distinct names and none is lost.
+    """
+    with _registry_lock(_resolve_path(registry_path)):
+        return _register_locked(
+            working_dir=working_dir, pid=pid, browser_version=browser_version,
+            user_data_dir=user_data_dir, port_override=port_override,
+            registry_path=registry_path, pid_start=pid_start,
+            persistent=persistent, profile=profile,
+        )
+
+
+def _register_locked(
+    working_dir: str,
+    pid: int,
+    browser_version: str,
+    user_data_dir: str,
+    port_override: int | None = None,
+    registry_path: str | None = None,
+    pid_start: str | None = None,
+    persistent: bool = False,
+    profile: str | None = None,
+) -> InstanceInfo:
+    """Register a new browser instance in the registry.
+
     Derives the instance name from working_dir basename.
     Auto-allocates a port unless port_override is specified.
 
@@ -577,13 +651,11 @@ def stop(
 
     if not info.alive:
         # Already dead -- just clean up the registry entry
-        registry = _load_registry(path)
-        entry = registry.pop(instance_name, None)
+        entry = _pop_entry(instance_name, path)
         if entry:
             session_dir = _entry_disposable_dir(entry)
             if session_dir and os.path.exists(session_dir):
                 shutil.rmtree(session_dir, ignore_errors=True)
-        _save_registry(registry, path)
         logger.info("Instance %s was already dead, cleaned up", instance_name)
         return f"{instance_name} was already dead, cleaned up"
 
@@ -636,13 +708,11 @@ def stop(
                 f"{instance_name} was stale (port {info.port} serves a different "
                 f"browser), cleaned up without touching it"
             )
-        registry = _load_registry(path)
-        entry = registry.pop(instance_name, None)
+        entry = _pop_entry(instance_name, path)
         if entry:
             session_dir = _entry_disposable_dir(entry)
             if session_dir and os.path.exists(session_dir):
                 shutil.rmtree(session_dir, ignore_errors=True)
-        _save_registry(registry, path)
         logger.info("%s", outcome)
         return outcome
 
@@ -682,13 +752,11 @@ def stop(
         time.sleep(0.1)
 
     # Clean up registry entry and session directory
-    registry = _load_registry(path)
-    entry = registry.pop(instance_name, None)
+    entry = _pop_entry(instance_name, path)
     if entry:
         session_dir = _entry_disposable_dir(entry)
         if session_dir and os.path.exists(session_dir):
             shutil.rmtree(session_dir, ignore_errors=True)
-    _save_registry(registry, path)
 
     logger.info("Stopped instance %s", instance_name)
     return f"Stopped {instance_name}"
@@ -728,11 +796,9 @@ def deregister(
     Returns True if an entry was removed.
     """
     path = _resolve_path(registry_path)
-    registry = _load_registry(path)
-    entry = registry.pop(instance_name, None)
+    entry = _pop_entry(instance_name, path)
     if entry is None:
         return False
-    _save_registry(registry, path)
     session_dir = _entry_disposable_dir(entry)
     if session_dir:
         _remove_session_dir(session_dir)
@@ -740,7 +806,16 @@ def deregister(
     return True
 
 
-def cleanup(
+def cleanup(registry_path: str | None = None) -> list[str]:
+    """Remove stale registry entries and their session directories.
+
+    Returns the list of removed instance names.
+    """
+    with _registry_lock(_resolve_path(registry_path)):
+        return _cleanup_locked(registry_path=registry_path)
+
+
+def _cleanup_locked(
     registry_path: str | None = None,
 ) -> list[str]:
     """Remove stale registry entries and their session directories.
