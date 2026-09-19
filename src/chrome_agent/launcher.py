@@ -165,8 +165,9 @@ def _resolve_profile_request(
     """Validate --profile / --profile-dir. Returns a ResolvedProfile or None."""
     if profile is None and profile_dir is None:
         return None
-    from .profiles import ProfileError, resolve_dir, resolve_named, _is_within
+    from .profiles import ProfileError, require_gui_session, resolve_dir, resolve_named, _is_within
 
+    require_gui_session()
     if profile is not None and profile_dir is not None:
         raise ProfileError("use either --profile or --profile-dir, not both")
     # Chrome honours the LAST --user-data-dir it is given, so a passthrough one

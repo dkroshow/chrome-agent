@@ -21,6 +21,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 
 _PROFILE_ROOT_ENV = "CHROME_AGENT_PROFILE_ROOT"
 _LOCKS_DIRNAME = ".locks"
+_ALLOW_NO_GUI_ENV = "CHROME_AGENT_ALLOW_NO_GUI_SESSION"
 
 
 class ProfileError(Exception):
@@ -112,6 +114,33 @@ def _everyday_chrome_dirs() -> list[str]:
         os.path.join(config, "chromium"),
         os.path.join(home, "snap", "chromium", "common", "chromium"),
     ]
+
+
+def require_gui_session() -> None:
+    """On macOS, refuse a persistent launch from outside the desktop session.
+
+    Chrome encrypts cookies with a key held in the login keychain. A process
+    started outside the GUI ("Aqua") session -- over SSH, from some daemons --
+    cannot use that keychain, so Chrome cannot decrypt the profile's saved
+    sessions: the browser comes up signed out, and the saved logins may be
+    lost for good. Refusing is the only safe answer. LaunchAgents, Terminal
+    and desktop apps run inside the GUI session and are unaffected.
+    """
+    if sys.platform != "darwin" or os.environ.get(_ALLOW_NO_GUI_ENV) == "1":
+        return
+    try:
+        manager = subprocess.run(
+            ["launchctl", "managername"], capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return
+    if manager and manager != "Aqua":
+        raise ProfileError(
+            f"refusing to open a persistent profile from a non-GUI macOS session "
+            f"({manager}): Chrome could not reach the login keychain here and the "
+            f"profile's saved logins could be lost. Launch from the desktop session "
+            f"(Terminal, a LaunchAgent), or set {_ALLOW_NO_GUI_ENV}=1 to override."
+        )
 
 
 def resolve_named(name: str, create: bool = True) -> ResolvedProfile:
