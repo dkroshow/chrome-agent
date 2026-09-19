@@ -543,3 +543,24 @@ def test_explicit_port_already_serving_is_refused(isolated):
         assert names == [first.name]
     finally:
         _stop(isolated, first.name)
+
+
+def test_persistent_launch_refused_outside_macos_gui_session(isolated, monkeypatch):
+    """Over SSH Chrome cannot reach the keychain and saved logins can be lost."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="Background\n", stderr="")
+
+    monkeypatch.setattr(profiles.sys, "platform", "darwin")
+    monkeypatch.setattr(profiles.subprocess, "run", fake_run)
+    with pytest.raises(ProfileError, match="non-GUI macOS session"):
+        asyncio.run(launch_browser(
+            headless=True, pin_to_desktop=False, registry_path=isolated["registry"], profile="ssh",
+        ))
+    assert calls == [["launchctl", "managername"]]
+    assert not os.path.exists(os.path.join(isolated["root"], "ssh"))
+
+    monkeypatch.setenv("CHROME_AGENT_ALLOW_NO_GUI_SESSION", "1")
+    profiles.require_gui_session()  # override: no refusal
