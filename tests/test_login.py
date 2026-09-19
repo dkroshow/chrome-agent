@@ -286,3 +286,25 @@ def test_cli_login_refuses_headless_instance(cli, site):
     assert legacy.returncode == 3 and "headless" in json.loads(legacy.stdout)["reason"]
     # The refusal left the running browser alone.
     assert launched["name"] in json.loads(open(cli.registry).read())
+
+
+def test_refusal_outside_desktop_session_creates_nothing(tmp_path, monkeypatch, capsys, site):
+    """login-check on macOS outside the GUI session: exit 3 JSON, no state."""
+    from chrome_agent import cli as cli_module, profiles
+
+    root = tmp_path / "profiles"
+    monkeypatch.setenv("CHROME_AGENT_PROFILE_ROOT", str(root))
+    monkeypatch.setattr(profiles.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        profiles.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="Background\n", stderr=""),
+    )
+    for command in ("login-check", "login"):
+        with pytest.raises(SystemExit) as exit_info:
+            asyncio.run(cli_module._run_login(
+                ["--profile", "remote", "--site", f"{site}/app", "--probe-expr", "true"],
+                wait=command == "login",
+            ))
+        assert exit_info.value.code == 3
+        assert json.loads(capsys.readouterr().out)["status"] == "error"
+        assert not root.exists()

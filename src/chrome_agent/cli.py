@@ -424,7 +424,10 @@ async def _run_login(args: list[str], wait: bool) -> None:
             # without it a second check reuses the first one's browser and has
             # it stopped underneath it.
             from .launcher import _SESSION_ROOT, _async_flock
-            from .profiles import lock_path, resolve_dir, resolve_named
+            from .profiles import lock_path, require_gui_session, resolve_dir, resolve_named
+            # Before resolving: resolving creates the profile and lock
+            # directories, and a refused launch must leave nothing behind.
+            require_gui_session()
             resolved = (
                 resolve_named(opts["--profile"]) if opts["--profile"]
                 else resolve_dir(opts["--profile-dir"], session_root=_SESSION_ROOT)
