@@ -510,7 +510,7 @@ async def _shutdown_own_browser(info) -> bool:
     nothing of the browser is left.
     """
     from .cdp_client import CDPClient, get_ws_url
-    from .launcher import browser_processes, kill_browser_processes
+    from .utils import browser_processes, kill_browser_processes
     from .registry import _port_is_listening, deregister
 
     async def polite_close():

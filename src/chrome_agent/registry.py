@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .utils import process_is_ours
+from .utils import browser_processes, kill_browser_processes, process_is_ours
 
 logger = logging.getLogger(__name__)
 
@@ -812,6 +812,21 @@ def stop(
             if not process_is_ours(pid=info.pid, expected_start=info.pid_start):
                 break
             time.sleep(0.1)
+
+    # The recorded PID can be a launcher that handed off and exited (macOS):
+    # then the checks above never touched the real browser. Find it by its
+    # exact arguments -- this instance's profile directory and port -- and
+    # make sure it is gone before the entry disappears, or the browser would
+    # live on where nothing can find or stop it.
+    browser_dir = info.user_data_dir
+    if browser_dir:
+        for signal_number in (15, 9, 9):
+            if not browser_processes(user_data_dir=browser_dir, port=info.port) and not _port_is_listening(info.port):
+                break
+            kill_browser_processes(user_data_dir=browser_dir, port=info.port, signal_number=signal_number)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and browser_processes(user_data_dir=browser_dir, port=info.port):
+                time.sleep(0.1)
 
     # Clean up registry entry and session directory
     entry = _pop_entry(instance_name, path)

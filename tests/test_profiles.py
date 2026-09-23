@@ -19,6 +19,7 @@ import pytest
 
 from chrome_agent import launcher, profiles
 from chrome_agent.cdp_client import CDPClient, get_ws_url
+from chrome_agent.connection import check_cdp_port
 from chrome_agent.launcher import cleanup_sessions, find_chrome_binary, launch_browser
 from chrome_agent.profiles import ProfileError
 from chrome_agent.registry import (
@@ -576,24 +577,70 @@ def test_gui_session_guard_fails_closed(isolated, monkeypatch, stdout, returncod
     profiles.require_gui_session()
 
 
-def test_browser_processes_matches_exact_arguments(monkeypatch):
-    """Paths with spaces match; a longer path sharing a prefix does not."""
-    from chrome_agent import launcher
+def test_browser_processes_compares_whole_argv_entries(monkeypatch):
+    """Whole-entry comparison: spaces, prefixes and embedded flags cannot confuse it."""
+    from chrome_agent import utils
 
     root = "/Users/me/Library/Application Support/chrome-agent/profiles"
-    ps = "\n".join([
-        f"101 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9400 --user-data-dir={root}/work --no-first-run --no-default-browser-check",
-        f"102 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9400 --user-data-dir={root}/work-2 --no-first-run --no-default-browser-check",
-        f"103 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9401 --user-data-dir={root}/work --no-first-run",
-        f"104 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helper --type=renderer --user-data-dir={root}/work --no-first-run --remote-debugging-port=9400 ",
-        f"105 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=94000 --user-data-dir={root}/work --no-first-run",
-    ]) + "\n"
-    monkeypatch.setattr(launcher.subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=ps, stderr=""))
-    monkeypatch.setattr(launcher, "process_is_ours", lambda pid, expected_start=None: True)
-    assert launcher.browser_processes(user_data_dir=f"{root}/work", port=9400) == [101]
-    assert launcher.browser_processes(user_data_dir=f"{root}/work-2", port=9400) == [102]
-    assert launcher.browser_processes(user_data_dir=f"{root}/wor", port=9400) == []
+    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    table = {
+        101: [chrome, "--remote-debugging-port=9400", f"--user-data-dir={root}/work", "--no-first-run"],
+        102: [chrome, "--remote-debugging-port=9400", f"--user-data-dir={root}/work-2", "--no-first-run"],
+        103: [chrome, "--remote-debugging-port=9401", f"--user-data-dir={root}/work", "--no-first-run"],
+        104: [chrome, "--type=renderer", f"--user-data-dir={root}/work", "--remote-debugging-port=9400"],
+        105: [chrome, "--remote-debugging-port=94000", f"--user-data-dir={root}/work", "--no-first-run"],
+        106: [chrome, "--remote-debugging-port=9400", f"--user-data-dir={root}/actual --no-first-run suffix", "--no-first-run"],
+    }
+    monkeypatch.setattr(utils, "_candidate_pids", lambda: list(table))
+    monkeypatch.setattr(utils, "process_argv", lambda pid: table.get(pid))
+    monkeypatch.setattr(utils, "process_is_ours", lambda pid, expected_start=None: True)
+    assert utils.browser_processes(user_data_dir=f"{root}/work", port=9400) == [101]
+    assert utils.browser_processes(user_data_dir=f"{root}/work-2", port=9400) == [102]
+    assert utils.browser_processes(user_data_dir=f"{root}/wor", port=9400) == []
+    assert utils.browser_processes(user_data_dir=f"{root}/actual", port=9400) == []
+    assert utils.browser_processes(user_data_dir=f"{root}/actual --no-first-run suffix", port=9400) == [106]
+
+
+@needs_chrome
+def test_browser_processes_reads_real_argv(isolated):
+    """Against a real browser: a directory whose name contains a flag and spaces."""
+    from chrome_agent.utils import browser_processes, process_argv
+
+    tricky = str(isolated["tmp"] / "actual --no-first-run suffix")
+    info = asyncio.run(_launch(isolated, PORT_A, profile_dir=tricky))
+    try:
+        argv = process_argv(info.pid)
+        assert argv and f"--user-data-dir={tricky}" in argv
+        assert browser_processes(user_data_dir=tricky, port=PORT_A) == [info.pid]
+        assert browser_processes(user_data_dir=str(isolated["tmp"] / "actual"), port=PORT_A) == []
+        assert browser_processes(user_data_dir=tricky, port=PORT_A + 1) == []
+    finally:
+        _stop(isolated, info.name)
+
+
+@needs_chrome
+def test_stop_finishes_a_handed_off_wedged_browser(isolated):
+    """Recorded pid exited (launcher handoff) and the real browser is wedged:
+    stop must still end the browser, not just drop the entry."""
+    import signal
+
+    info = asyncio.run(_launch(isolated, PORT_A, profile="handoff"))
+    registry = _load_registry(isolated["registry"])
+    registry[info.name]["pid"], registry[info.name]["pid_start"] = 2**22 + 7, "never"
+    _save_registry(registry, isolated["registry"])
+    os.kill(info.pid, signal.SIGSTOP)
+    try:
+        _stop(isolated, info.name)
+        for _ in range(30):
+            if not launcher.process_is_running(pid=info.pid):
+                break
+            asyncio.run(asyncio.sleep(0.1))
+        assert not launcher.process_is_running(pid=info.pid)
+        assert not check_cdp_port(port=PORT_A).listening
+        assert enumerate_instances(registry_path=isolated["registry"]) == []
+    finally:
+        with contextlib_suppress():
+            os.kill(info.pid, signal.SIGKILL)
 
 
 @needs_chrome

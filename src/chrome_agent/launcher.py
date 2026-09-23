@@ -19,7 +19,7 @@ from .connection import check_cdp_port
 from .registry import REGISTRY_PATH, InstanceInfo, allocate_port, register, cleanup
 from .registry import port_lock_path
 from .registry import _load_registry, _resolve_path
-from .utils import process_is_ours, process_is_running, process_start_time
+from .utils import browser_processes, kill_browser_processes, process_is_ours, process_is_running, process_start_time
 
 logger = logging.getLogger(__name__)
 
@@ -175,51 +175,6 @@ async def _wait_for_cdp(process, port: int):
         await asyncio.sleep(0.2)
     process.kill()
     raise TimeoutError("Browser did not start within 30 seconds")
-
-
-def browser_processes(user_data_dir: str, port: int) -> list[int]:
-    """PIDs of our user's Chrome processes launched on exactly this profile
-    directory and CDP port -- the two argv tokens chrome-agent itself passed.
-
-    The PID chrome-agent recorded is not always the browser: on macOS the
-    launched process can hand off to a child and exit, so a kill of the
-    recorded PID alone leaves the real browser running.
-
-    ``ps`` prints arguments space-joined with no quoting, and a profile path
-    can contain spaces (macOS: ``~/Library/Application Support/...``), so the
-    match is on the exact argument sequence chrome-agent writes -- the
-    directory followed by ``--no-first-run`` -- never on split tokens, which
-    would truncate at the first space or accept a longer path sharing a prefix.
-    """
-    dir_arg = f"--user-data-dir={user_data_dir} --no-first-run"
-    port_arg = f"--remote-debugging-port={port} "
-    try:
-        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    pids = []
-    for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2:
-            continue
-        command = parts[1]
-        if "--type=" in command or port_arg not in command or dir_arg not in command:
-            continue
-        if process_is_ours(pid=int(parts[0])):
-            pids.append(int(parts[0]))
-    return pids
-
-
-def kill_browser_processes(user_data_dir: str, port: int, signal_number: int = 9) -> list[int]:
-    """Signal every process ``browser_processes`` finds. Returns the PIDs hit."""
-    hit = []
-    for pid in browser_processes(user_data_dir=user_data_dir, port=port):
-        try:
-            os.kill(pid, signal_number)
-            hit.append(pid)
-        except ProcessLookupError:
-            pass
-    return hit
 
 
 def _resolve_profile_request(
