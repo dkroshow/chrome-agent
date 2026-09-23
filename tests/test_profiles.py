@@ -739,3 +739,27 @@ def test_clone_starts_signed_in_and_leaves_source_intact(isolated, login_server)
     assert _cli(isolated, "profiles", "clone", "template", "Bad Name").returncode == 1
     assert _cli(isolated, "profiles", "clone", "nope", "x").returncode == 1
     assert not os.path.exists(os.path.join(isolated["root"], "x"))
+
+
+def test_clone_never_touches_other_profiles_or_follows_symlinks(isolated):
+    """Checker findings: a 'victim.cloning' profile must survive; symlinks refuse."""
+    src = profiles.resolve_named("template")
+    with open(os.path.join(src.path, "marker"), "w") as f:
+        f.write("state")
+    victim = profiles.resolve_named("victim.cloning")
+    with open(os.path.join(victim.path, "keep"), "w") as f:
+        f.write("mine")
+
+    assert _cli(isolated, "profiles", "clone", "template", "victim").returncode == 0
+    assert open(os.path.join(victim.path, "keep")).read() == "mine"
+    assert open(os.path.join(isolated["root"], "victim", "marker")).read() == "state"
+    assert not [e for e in os.listdir(isolated["root"]) if e.startswith(".clone-")]
+
+    outside = isolated["tmp"] / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("x")
+    os.symlink(outside, os.path.join(src.path, "Extensions-link"))
+    refused = _cli(isolated, "profiles", "clone", "template", "copy2")
+    assert refused.returncode == 1 and "symlink" in refused.stderr
+    assert not os.path.exists(os.path.join(isolated["root"], "copy2"))
+    assert not [e for e in os.listdir(isolated["root"]) if e.startswith(".clone-")]

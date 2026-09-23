@@ -10,10 +10,11 @@ and cleanup. There are two ways to ask for one:
 - ``--profile-dir PATH``: a directory the caller owns. chrome-agent uses it
   and never deletes it, under any command.
 
-Chrome owns everything inside the directory. chrome-agent never reads, copies
-or exports authentication or browsing data. The one thing it reads is the
-target of Chrome's ``SingletonLock`` (a host name and PID), to tell whether a
-browser is using the profile.
+Chrome owns everything inside the directory. chrome-agent never reads or
+exports authentication or browsing data, and never copies it except as a
+whole-profile copy on the same machine through ``profiles clone``. The one
+thing it reads is the target of Chrome's ``SingletonLock`` (a host name and
+PID), to tell whether a browser is using the profile.
 """
 
 import contextlib
@@ -23,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 
 # Lowercase only: macOS and Windows filesystems are case-insensitive by
@@ -285,11 +287,12 @@ def clone_named(source: str, new: str) -> str:
 
     A profile is the unit of sign-in: a fresh one starts signed out, and only a
     person can change that. Cloning a profile that already holds a Chrome
-    sign-in gives a new, separately usable profile that starts signed in --
-    "save as" for profiles. Everything Chrome saved comes along (sessions,
-    extensions, settings). Nothing is read or exported: the directory is
-    copied on this machine, and Chrome's cookie key lives in this user's
-    keychain, so the copy decrypts exactly what the original did.
+    sign-in gives a new, separately usable profile that starts from the same
+    saved state -- "save as" for profiles. Everything Chrome saved is copied
+    (sessions, extensions, settings), which is the one place chrome-agent
+    copies profile data; it still reads none of it. The copy is on this
+    machine, so Chrome's credential store can open it; a site may still ask
+    for a fresh login when it treats the clone as a new device.
 
     Refused while a browser holds the source; the caller must hold
     ``launch_lock`` for both directories. Returns the new profile's path.
@@ -302,20 +305,30 @@ def clone_named(source: str, new: str) -> str:
     holder = singleton_holder_pid(src.path)
     if holder is not None and _pid_running(holder):
         raise ProfileError(f"profile {source!r} is in use by a browser (pid {holder}); stop it first")
+    for dirpath, dirnames, filenames in os.walk(src.path):
+        for entry in dirnames + filenames:
+            if os.path.islink(os.path.join(dirpath, entry)) and entry not in _NEVER_COPY:
+                # Chrome writes no symlinks besides its lock files. One here
+                # means something outside Chrome touched the profile; copying
+                # its target could pull in a directory outside the profile.
+                raise ProfileError(
+                    f"profile {source!r} contains an unexpected symlink "
+                    f"({os.path.relpath(os.path.join(dirpath, entry), src.path)}); refusing to clone"
+                )
 
     def ignore(directory: str, names: list[str]) -> set[str]:
         return {n for n in names if n in _NEVER_COPY}
 
-    tmp_path = dest_path + ".cloning"
-    if os.path.lexists(tmp_path):
-        shutil.rmtree(tmp_path)
+    # A private, unique staging directory: names beginning with '.' are not
+    # valid profile names, so this can never collide with or destroy a profile.
+    staging = tempfile.mkdtemp(prefix=f".clone-{new}-", dir=profile_root())
+    tmp_path = os.path.join(staging, new)
     try:
-        shutil.copytree(src.path, tmp_path, symlinks=False, ignore=ignore, copy_function=shutil.copy2)
+        shutil.copytree(src.path, tmp_path, symlinks=True, ignore=ignore, copy_function=shutil.copy2)
         os.chmod(tmp_path, 0o700)
         os.rename(tmp_path, dest_path)
-    except BaseException:
-        shutil.rmtree(tmp_path, ignore_errors=True)
-        raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return dest_path
 
 

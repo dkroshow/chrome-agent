@@ -591,7 +591,10 @@ def _run_profiles(args: list[str]) -> None:
             from .profiles import clone_named, resolve_named as _resolve
             source, new = args[1], args[2]
             src = _resolve(source, create=False)
-            with launch_lock(src.path):
+            from .profiles import validate_name as _validate
+            _validate(new)
+            dest_dir = os.path.join(profile_root(), new)
+            with launch_lock(src.path), launch_lock(dest_dir):
                 running = find_by_profile_dir(src.path)
                 if running is not None:
                     raise ProfileError(f"profile {source!r} is in use by instance {running.name}; stop it first")
