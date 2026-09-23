@@ -666,3 +666,36 @@ def test_stop_kills_a_browser_that_ignores_close_and_term(isolated):
 def contextlib_suppress():
     import contextlib
     return contextlib.suppress(ProcessLookupError)
+
+
+def test_linux_cmdline_flattened_is_unknown():
+    from chrome_agent.utils import _parse_linux_cmdline
+
+    assert _parse_linux_cmdline(b"chrome\0--remote-debugging-port=9400\0--user-data-dir=/tmp/actual --no-first-run suffix\0") \
+        == ["chrome", "--remote-debugging-port=9400", "--user-data-dir=/tmp/actual --no-first-run suffix"]
+    assert _parse_linux_cmdline(b"chrome --remote-debugging-port=9400 --user-data-dir=/tmp/actual --no-first-run suffix\0") is None
+    assert _parse_linux_cmdline(b"") is None
+
+
+@needs_chrome
+def test_stop_fails_closed_when_the_browser_cannot_be_identified(isolated, monkeypatch):
+    """argv unreadable + recorded pid dead + browser wedged: keep the entry, say so."""
+    import signal
+    from chrome_agent import utils
+    from chrome_agent.registry import StopIncomplete
+
+    info = asyncio.run(_launch(isolated, PORT_A, profile="unknowable"))
+    registry = _load_registry(isolated["registry"])
+    registry[info.name]["pid"], registry[info.name]["pid_start"] = 2**22 + 9, "never"
+    _save_registry(registry, isolated["registry"])
+    os.kill(info.pid, signal.SIGSTOP)
+    monkeypatch.setattr(utils, "process_argv", lambda pid: None)
+    try:
+        with pytest.raises(StopIncomplete, match="still serving"):
+            _stop(isolated, info.name)
+        assert [i.name for i in enumerate_instances(registry_path=isolated["registry"])] == [info.name]
+    finally:
+        monkeypatch.undo()
+        os.kill(info.pid, signal.SIGKILL)
+        asyncio.run(asyncio.sleep(1.0))
+        _stop(isolated, info.name)

@@ -60,6 +60,10 @@ class InstanceInfo:
     headless: bool = False
 
 
+class StopIncomplete(RuntimeError):
+    """stop() could not verify the browser is gone; the registry entry is kept."""
+
+
 class InstanceNotFoundError(Exception):
     """Named instance not found in the registry."""
     def __init__(self, name: str, available: list[str]):
@@ -827,6 +831,15 @@ def stop(
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline and browser_processes(user_data_dir=browser_dir, port=info.port):
                 time.sleep(0.1)
+    # Fail closed: a listener still on the port after all of that is a browser
+    # this instance may own that could not be identified (argv unreadable) or
+    # would not die. Dropping the entry would orphan it, so keep the entry.
+    if _port_is_listening(info.port) and not process_is_ours(pid=info.pid, expected_start=info.pid_start):
+        raise StopIncomplete(
+            f"{instance_name}: a browser is still serving port {info.port} and could not "
+            f"be verified as stopped; the registry entry is kept. Inspect it with "
+            f"'chrome-agent status {instance_name}' and stop it by hand if it is yours."
+        )
 
     # Clean up registry entry and session directory
     entry = _pop_entry(instance_name, path)

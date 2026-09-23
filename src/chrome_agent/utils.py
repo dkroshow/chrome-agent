@@ -96,13 +96,23 @@ def process_argv(pid: int) -> list[str] | None:
                 raw = f.read()
         except OSError:
             return None
-        # Chrome rewrites its argv into one space-joined string on Linux; in
-        # that case split on whitespace (upstream accepts that ambiguity).
-        parts = [p.decode(errors="replace") for p in raw.split(b"\0") if p]
-        return parts[0].split() if len(parts) == 1 and " " in parts[0] else parts
+        return _parse_linux_cmdline(raw)
     if sys.platform == "darwin":
         return _darwin_procargs(pid)
     return None
+
+
+def _parse_linux_cmdline(raw: bytes) -> list[str] | None:
+    """NUL-separated argv, or None when it is not unambiguous.
+
+    Chrome on Linux rewrites its argv into one space-joined entry. Splitting
+    that on spaces would recreate exactly the ambiguity this function exists
+    to remove, so a single entry containing spaces is reported as unknown.
+    """
+    parts = [p.decode(errors="replace") for p in raw.split(b"\0") if p]
+    if len(parts) == 1 and " " in parts[0]:
+        return None
+    return parts or None
 
 
 def _darwin_procargs(pid: int) -> list[str] | None:
