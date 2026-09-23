@@ -10,9 +10,10 @@ and cleanup. There are two ways to ask for one:
 - ``--profile-dir PATH``: a directory the caller owns. chrome-agent uses it
   and never deletes it, under any command.
 
-Chrome owns everything inside the directory. chrome-agent never reads or
-exports authentication or browsing data, and never copies it except as a
-whole-profile copy on the same machine through ``profiles clone``. The one
+Chrome owns everything inside the directory. chrome-agent never inspects,
+interprets, decodes or exports authentication or browsing data. The one
+operation that touches the bytes is ``profiles clone``, a whole-profile copy
+on the same machine. The one
 thing it reads is the target of Chrome's ``SingletonLock`` (a host name and
 PID), to tell whether a browser is using the profile.
 """
@@ -290,7 +291,7 @@ def clone_named(source: str, new: str) -> str:
     sign-in gives a new, separately usable profile that starts from the same
     saved state -- "save as" for profiles. Everything Chrome saved is copied
     (sessions, extensions, settings), which is the one place chrome-agent
-    copies profile data; it still reads none of it. The copy is on this
+    copies profile data; it does not inspect, interpret, decode or export any of it. The copy is on this
     machine, so Chrome's credential store can open it; a site may still ask
     for a fresh login when it treats the clone as a new device.
 

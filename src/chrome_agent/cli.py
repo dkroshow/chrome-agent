@@ -593,8 +593,15 @@ def _run_profiles(args: list[str]) -> None:
             src = _resolve(source, create=False)
             from .profiles import validate_name as _validate
             _validate(new)
+            if new == source:
+                raise ProfileError(f"cannot clone profile {source!r} onto itself")
             dest_dir = os.path.join(profile_root(), new)
-            with launch_lock(src.path), launch_lock(dest_dir):
+            if os.path.lexists(dest_dir):
+                raise ProfileError(f"profile {new!r} already exists")
+            # Two distinct locks, always in the same (path) order, so two
+            # concurrent clones between the same pair cannot deadlock.
+            first, second = sorted((src.path, dest_dir))
+            with launch_lock(first), launch_lock(second):
                 running = find_by_profile_dir(src.path)
                 if running is not None:
                     raise ProfileError(f"profile {source!r} is in use by instance {running.name}; stop it first")

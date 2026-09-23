@@ -763,3 +763,18 @@ def test_clone_never_touches_other_profiles_or_follows_symlinks(isolated):
     assert refused.returncode == 1 and "symlink" in refused.stderr
     assert not os.path.exists(os.path.join(isolated["root"], "copy2"))
     assert not [e for e in os.listdir(isolated["root"]) if e.startswith(".clone-")]
+
+
+def test_clone_self_and_existing_refuse_promptly(isolated):
+    profiles.resolve_named("template")
+    profiles.resolve_named("taken")
+    import time
+    for target in ("template", "taken"):
+        t0 = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-m", "chrome_agent", "profiles", "clone", "template", target],
+            capture_output=True, text=True, timeout=10,
+            env=dict(os.environ, CHROME_AGENT_PROFILE_ROOT=isolated["root"]),
+        )
+        assert proc.returncode == 1 and ("itself" in proc.stderr or "already exists" in proc.stderr), proc.stderr
+        assert time.monotonic() - t0 < 5
