@@ -799,6 +799,19 @@ def stop(
         if not process_is_ours(pid=info.pid, expected_start=info.pid_start):
             break
         time.sleep(0.1)
+    else:
+        # Still our verified process after Browser.close and SIGTERM: a wedged
+        # browser ignores both. Deregistering it now would orphan a live
+        # Chrome nothing can find, so escalate to SIGKILL and wait again.
+        try:
+            os.kill(info.pid, 9)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not process_is_ours(pid=info.pid, expected_start=info.pid_start):
+                break
+            time.sleep(0.1)
 
     # Clean up registry entry and session directory
     entry = _pop_entry(instance_name, path)

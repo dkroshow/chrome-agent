@@ -574,3 +574,48 @@ def test_gui_session_guard_fails_closed(isolated, monkeypatch, stdout, returncod
     assert not os.path.exists(isolated["registry"])
     monkeypatch.setenv("CHROME_AGENT_ALLOW_NO_GUI_SESSION", "1")
     profiles.require_gui_session()
+
+
+def test_browser_processes_matches_exact_arguments(monkeypatch):
+    """Paths with spaces match; a longer path sharing a prefix does not."""
+    from chrome_agent import launcher
+
+    root = "/Users/me/Library/Application Support/chrome-agent/profiles"
+    ps = "\n".join([
+        f"101 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9400 --user-data-dir={root}/work --no-first-run --no-default-browser-check",
+        f"102 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9400 --user-data-dir={root}/work-2 --no-first-run --no-default-browser-check",
+        f"103 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9401 --user-data-dir={root}/work --no-first-run",
+        f"104 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Helper --type=renderer --user-data-dir={root}/work --no-first-run --remote-debugging-port=9400 ",
+        f"105 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=94000 --user-data-dir={root}/work --no-first-run",
+    ]) + "\n"
+    monkeypatch.setattr(launcher.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=ps, stderr=""))
+    monkeypatch.setattr(launcher, "process_is_ours", lambda pid, expected_start=None: True)
+    assert launcher.browser_processes(user_data_dir=f"{root}/work", port=9400) == [101]
+    assert launcher.browser_processes(user_data_dir=f"{root}/work-2", port=9400) == [102]
+    assert launcher.browser_processes(user_data_dir=f"{root}/wor", port=9400) == []
+
+
+@needs_chrome
+def test_stop_kills_a_browser_that_ignores_close_and_term(isolated):
+    """A wedged browser (simulated by SIGSTOP) must be gone after stop()."""
+    import signal
+
+    info = asyncio.run(_launch(isolated, PORT_A, profile="frozen"))
+    os.kill(info.pid, signal.SIGSTOP)  # ignores Browser.close and SIGTERM until resumed
+    try:
+        _stop(isolated, info.name)
+        for _ in range(30):
+            if not launcher.process_is_running(pid=info.pid):
+                break
+            asyncio.run(asyncio.sleep(0.1))
+        assert not launcher.process_is_running(pid=info.pid)
+        assert enumerate_instances(registry_path=isolated["registry"]) == []
+    finally:
+        with contextlib_suppress():
+            os.kill(info.pid, signal.SIGKILL)
+
+
+def contextlib_suppress():
+    import contextlib
+    return contextlib.suppress(ProcessLookupError)

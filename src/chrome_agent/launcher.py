@@ -184,8 +184,15 @@ def browser_processes(user_data_dir: str, port: int) -> list[int]:
     The PID chrome-agent recorded is not always the browser: on macOS the
     launched process can hand off to a child and exit, so a kill of the
     recorded PID alone leaves the real browser running.
+
+    ``ps`` prints arguments space-joined with no quoting, and a profile path
+    can contain spaces (macOS: ``~/Library/Application Support/...``), so the
+    match is on the exact argument sequence chrome-agent writes -- the
+    directory followed by ``--no-first-run`` -- never on split tokens, which
+    would truncate at the first space or accept a longer path sharing a prefix.
     """
-    wanted = {f"--user-data-dir={user_data_dir}", f"--remote-debugging-port={port}"}
+    dir_arg = f"--user-data-dir={user_data_dir} --no-first-run"
+    port_arg = f"--remote-debugging-port={port} "
     try:
         out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
@@ -195,8 +202,10 @@ def browser_processes(user_data_dir: str, port: int) -> list[int]:
         parts = line.split(None, 1)
         if len(parts) != 2:
             continue
-        tokens = set(parts[1].split())
-        if wanted <= tokens and "--type=" not in parts[1] and process_is_ours(pid=int(parts[0])):
+        command = parts[1]
+        if "--type=" in command or port_arg not in command or dir_arg not in command:
+            continue
+        if process_is_ours(pid=int(parts[0])):
             pids.append(int(parts[0]))
     return pids
 
