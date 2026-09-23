@@ -240,7 +240,7 @@ def _print_static_usage() -> None:
     print("Operational commands:")
     print("  launch [--port PORT] [--fingerprint PATH] [--headless] [--no-window-border] [-- CHROME_ARGS]  Launch Chrome")
     print("         [--profile NAME | --profile-dir PATH]           Keep logins: use a persistent profile")
-    print("  profiles [list | path [NAME] | remove NAME --yes]      Manage persistent named profiles")
+    print("  profiles [list | path [NAME] | clone SOURCE NEW | remove NAME --yes]  Manage persistent named profiles")
     print("  login-check (<instance> | --profile NAME | --profile-dir PATH) --site URL (--probe FILE | --probe-expr JS)")
     print("                                                         Is the site signed in? exit 0 yes, 2 needs login, 3 error")
     print("  login (same options) [--timeout SECONDS]               Open the site visibly; wait until a person has signed in")
@@ -587,6 +587,20 @@ def _run_profiles(args: list[str]) -> None:
             print(json.dumps(rows))
         elif action == "path" and len(args) <= 2:
             print(resolve_named(args[1], create=False).path if len(args) == 2 else profile_root())
+        elif action == "clone" and len(args) == 3:
+            from .profiles import clone_named, resolve_named as _resolve
+            source, new = args[1], args[2]
+            src = _resolve(source, create=False)
+            with launch_lock(src.path):
+                running = find_by_profile_dir(src.path)
+                if running is not None:
+                    raise ProfileError(f"profile {source!r} is in use by instance {running.name}; stop it first")
+                path = clone_named(source, new)
+            if sys.stdout.isatty():
+                print(f"Cloned profile {source} -> {new}")
+                print(f"  Path: {path}")
+            else:
+                print(json.dumps({"source": source, "profile": new, "profile_dir": path}))
         elif action == "remove" and len(args) >= 2:
             name = args[1]
             if args[2:] != ["--yes"]:
@@ -611,7 +625,7 @@ def _run_profiles(args: list[str]) -> None:
                 remove_named(name)
             print(f"Removed profile {name}")
         else:
-            print("Usage: chrome-agent profiles [list | path [NAME] | remove NAME --yes]", file=sys.stderr)
+            print("Usage: chrome-agent profiles [list | path [NAME] | clone SOURCE NEW | remove NAME --yes]", file=sys.stderr)
             sys.exit(1)
     except ProfileError as exc:
         print(f"Error: {exc}", file=sys.stderr)

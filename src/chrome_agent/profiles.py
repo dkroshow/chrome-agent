@@ -275,6 +275,60 @@ def singleton_holder_pid(profile_path: str) -> int | None:
         return None
 
 
+# Chrome's per-instance lock and IPC files. A copy must not carry them: a
+# stale SingletonLock would make the clone believe another Chrome holds it.
+_NEVER_COPY = {"SingletonLock", "SingletonSocket", "SingletonCookie", "lockfile", "RunningChromeVersion"}
+
+
+def clone_named(source: str, new: str) -> str:
+    """Copy managed profile ``source`` to a new managed profile ``new``.
+
+    A profile is the unit of sign-in: a fresh one starts signed out, and only a
+    person can change that. Cloning a profile that already holds a Chrome
+    sign-in gives a new, separately usable profile that starts signed in --
+    "save as" for profiles. Everything Chrome saved comes along (sessions,
+    extensions, settings). Nothing is read or exported: the directory is
+    copied on this machine, and Chrome's cookie key lives in this user's
+    keychain, so the copy decrypts exactly what the original did.
+
+    Refused while a browser holds the source; the caller must hold
+    ``launch_lock`` for both directories. Returns the new profile's path.
+    """
+    src = resolve_named(source, create=False)
+    validate_name(new)
+    dest_path = os.path.join(profile_root(), new)
+    if os.path.lexists(dest_path):
+        raise ProfileError(f"profile {new!r} already exists")
+    holder = singleton_holder_pid(src.path)
+    if holder is not None and _pid_running(holder):
+        raise ProfileError(f"profile {source!r} is in use by a browser (pid {holder}); stop it first")
+
+    def ignore(directory: str, names: list[str]) -> set[str]:
+        return {n for n in names if n in _NEVER_COPY}
+
+    tmp_path = dest_path + ".cloning"
+    if os.path.lexists(tmp_path):
+        shutil.rmtree(tmp_path)
+    try:
+        shutil.copytree(src.path, tmp_path, symlinks=False, ignore=ignore, copy_function=shutil.copy2)
+        os.chmod(tmp_path, 0o700)
+        os.rename(tmp_path, dest_path)
+    except BaseException:
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        raise
+    return dest_path
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def remove_named(name: str) -> str:
     """Delete a managed named profile. The only deletion path for profiles.
 

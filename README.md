@@ -193,7 +193,7 @@ An attach session **exits on its own once it has outlived its purpose** -- when 
 ```
 chrome-agent launch [--headless] [--fingerprint PATH] [--port PORT] [--no-window-border]
                     [--profile NAME | --profile-dir PATH]
-chrome-agent profiles [list | path [NAME] | remove NAME --yes]
+chrome-agent profiles [list | path [NAME] | clone SOURCE NEW | remove NAME --yes]
 chrome-agent login-check (<instance> | --profile NAME | --profile-dir PATH) --site URL (--probe FILE | --probe-expr JS) [--timeout S]
 chrome-agent login       (same options; default timeout 600 s)
 chrome-agent status [<instance|glob>]
@@ -208,7 +208,7 @@ chrome-agent --version
 | Command | Description |
 |---------|-------------|
 | `launch` | Find Chrome, launch with CDP enabled. Auto-allocates a port and names the instance from the current directory. |
-| `profiles` | Manage persistent named profiles: `list` them, print a `path`, or `remove NAME --yes`. See [Persistent Profiles](#persistent-profiles). |
+| `profiles` | Manage persistent named profiles: `list` them, print a `path`, `clone SOURCE NEW` ("save as": a new profile that starts with the source's sign-ins), or `remove NAME --yes`. See [Persistent Profiles](#persistent-profiles). |
 | `login-check` / `login` | Ask "is this browser signed in to the site?" with a probe you supply, or open the site and wait for a person to sign in. Exit `0` signed in, `2` needs a person, `3` error. See [Login Checks](#login-checks). |
 | `status` | List running instances with their page targets (IDs, URLs, titles). Accepts a glob to list a matching subset. |
 | `attach` | Persistent event observation with isolated subscriptions. Use `--target` (fewer than 8 digits is a tab index, anything else a target-id prefix), `--url substring`, or the explicit `--target-id` / `--target-index` for multi-tab browsers. |
@@ -234,12 +234,14 @@ chrome-agent launch --profile work          # still signed in
 
 chrome-agent profiles list
 chrome-agent profiles path work             # where it lives
+chrome-agent profiles clone work work-2     # "save as": work-2 starts signed in like work (source must be stopped)
 chrome-agent profiles remove work --yes     # the only command that deletes a profile
 ```
 
 - **`--profile NAME`** uses a profile chrome-agent manages under a per-user directory (owner-only, mode `0700`, on macOS and Linux; `~/Library/Application Support/chrome-agent/profiles` on macOS, `$XDG_DATA_HOME/chrome-agent/profiles` on Linux, `%LOCALAPPDATA%\chrome-agent\profiles` on Windows; override with `CHROME_AGENT_PROFILE_ROOT`). Names are lowercase letters, digits, `.`, `_` and `-`. Use one profile per account context: sites that share a sign-in can share a profile; accounts that must not mix get separate profiles.
 - **`--profile-dir PATH`** uses a directory you own, anywhere. chrome-agent never deletes it -- not on `stop`, not on `cleanup`, and `profiles remove` does not apply to it. Refused: a symlink, another user's directory, your everyday Chrome profile, and anything under `/tmp/chrome-agent`.
 - **One browser per profile.** Launching a profile that is already running returns that instance (`"reused": true` in the JSON output) instead of starting a second browser. If a browser chrome-agent does not manage holds the profile, the launch is refused. `status` shows each instance's `profile` / `profile_dir`, so callers can select a browser by profile rather than by position.
+- **`profiles clone SOURCE NEW`** copies a stopped managed profile to a new name on this machine. A profile is the unit of sign-in and a fresh one always starts signed out, so this is how a new profile starts already signed in: keep one template profile with your Chrome sign-in and clone it. Everything Chrome saved comes along (sessions, extensions, settings); Chrome's own lock files do not. Nothing is read or exported; the copy decrypts because the cookie key lives in this user's keychain. Sites may treat the clone as a new device.
 - **`profiles remove`** requires `--yes`, and refuses while any browser is using the profile. It is **not supported on Windows**, where chrome-agent cannot verify that a profile is idle; delete the directory yourself there.
 - A raw `-- --user-data-dir=...` cannot be combined with either option: Chrome honours the last one it is given, which would silently move the browser off the profile chrome-agent records and protects.
 

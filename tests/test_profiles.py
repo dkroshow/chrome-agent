@@ -699,3 +699,43 @@ def test_stop_fails_closed_when_the_browser_cannot_be_identified(isolated, monke
         os.kill(info.pid, signal.SIGKILL)
         asyncio.run(asyncio.sleep(1.0))
         _stop(isolated, info.name)
+
+
+@needs_chrome
+def test_clone_starts_signed_in_and_leaves_source_intact(isolated, login_server):
+    """'Save as' for profiles: the clone opens with the source's login."""
+    src = asyncio.run(_launch(isolated, PORT_A, profile="template"))
+    asyncio.run(_visit(PORT_A, f"{login_server}/login"))
+    assert asyncio.run(_visit(PORT_A, f"{login_server}/whoami")) == "in"
+
+    # Refused while the source is running.
+    refused = _cli(isolated, "profiles", "clone", "template", "copy")
+    assert refused.returncode == 1 and "in use" in refused.stderr
+    _stop(isolated, src.name)
+
+    done = _cli(isolated, "profiles", "clone", "template", "copy")
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout)["profile"] == "copy"
+    copy_dir = os.path.join(isolated["root"], "copy")
+    assert os.stat(copy_dir).st_mode & 0o777 == 0o700
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        assert not os.path.lexists(os.path.join(copy_dir, name))
+    assert sorted(profiles.list_profiles()) == ["copy", "template"]
+
+    clone = asyncio.run(_launch(isolated, PORT_B, profile="copy"))
+    try:
+        assert asyncio.run(_visit(PORT_B, f"{login_server}/whoami")) == "in"
+        # Both usable at once, each on its own browser.
+        again = asyncio.run(_launch(isolated, PORT_A, profile="template"))
+        try:
+            assert asyncio.run(_visit(PORT_A, f"{login_server}/whoami")) == "in"
+        finally:
+            _stop(isolated, again.name)
+    finally:
+        _stop(isolated, clone.name)
+
+    # Refusals: existing destination, bad names, missing source.
+    assert _cli(isolated, "profiles", "clone", "template", "copy").returncode == 1
+    assert _cli(isolated, "profiles", "clone", "template", "Bad Name").returncode == 1
+    assert _cli(isolated, "profiles", "clone", "nope", "x").returncode == 1
+    assert not os.path.exists(os.path.join(isolated["root"], "x"))
