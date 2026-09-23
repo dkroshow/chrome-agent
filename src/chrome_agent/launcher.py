@@ -157,6 +157,62 @@ async def _async_flock(lock_file: str):
         os.close(fd)
 
 
+async def _wait_for_cdp(process, port: int):
+    """Poll until the browser's CDP port listens; raise if it dies or stalls."""
+    deadline = asyncio.get_event_loop().time() + 30.0
+    while asyncio.get_event_loop().time() < deadline:
+        if process.poll() is not None:
+            if process.stderr:
+                process.stderr.seek(0)
+            stderr_output = process.stderr.read().decode(errors="replace") if process.stderr else ""
+            raise RuntimeError(
+                f"Chrome exited immediately with code {process.returncode}. "
+                f"stderr: {stderr_output[:500]}"
+            )
+        status = check_cdp_port(port=port)
+        if status.listening:
+            return status
+        await asyncio.sleep(0.2)
+    process.kill()
+    raise TimeoutError("Browser did not start within 30 seconds")
+
+
+def browser_processes(user_data_dir: str, port: int) -> list[int]:
+    """PIDs of our user's Chrome processes launched on exactly this profile
+    directory and CDP port -- the two argv tokens chrome-agent itself passed.
+
+    The PID chrome-agent recorded is not always the browser: on macOS the
+    launched process can hand off to a child and exit, so a kill of the
+    recorded PID alone leaves the real browser running.
+    """
+    wanted = {f"--user-data-dir={user_data_dir}", f"--remote-debugging-port={port}"}
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        tokens = set(parts[1].split())
+        if wanted <= tokens and "--type=" not in parts[1] and process_is_ours(pid=int(parts[0])):
+            pids.append(int(parts[0]))
+    return pids
+
+
+def kill_browser_processes(user_data_dir: str, port: int, signal_number: int = 9) -> list[int]:
+    """Signal every process ``browser_processes`` finds. Returns the PIDs hit."""
+    hit = []
+    for pid in browser_processes(user_data_dir=user_data_dir, port=port):
+        try:
+            os.kill(pid, signal_number)
+            hit.append(pid)
+        except ProcessLookupError:
+            pass
+    return hit
+
+
 def _resolve_profile_request(
     profile: str | None,
     profile_dir: str | None,
@@ -310,37 +366,34 @@ async def _launch_browser(
             env["TZ"] = fp_profile.timezone
 
         # Phase 4: Launch subprocess
+        # Chrome's stderr goes to a real temporary file, never a pipe. With a
+        # pipe nobody drains, Chrome 153 (macOS, headless) wedges its DevTools
+        # server after a few hundred bytes of logging: /json stops answering
+        # and every CDP client hangs. The file is read only if Chrome exits
+        # during startup, to include its complaint in the error.
+        stderr_file = tempfile.TemporaryFile(prefix="chrome-agent-stderr-")
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=stderr_file,
             env=env,
         )
+        process.stderr = stderr_file
         # Capture the process's start-time identity token immediately, while the
         # PID is guaranteed to still be this process (wrapper installs can exit
         # fast). (pid, pid_start) lets liveness checks detect PID recycling.
         pid_start = process_start_time(pid=process.pid)
         logger.info("Launched Chrome PID %d on port %d", process.pid, port)
 
-        # Phase 5: Wait for CDP port to be ready
-        deadline = asyncio.get_event_loop().time() + 30.0
-        status = None
-        while asyncio.get_event_loop().time() < deadline:
-            # Check if process died
-            if process.poll() is not None:
-                stderr_output = process.stderr.read().decode(errors="replace") if process.stderr else ""
-                raise RuntimeError(
-                    f"Chrome exited immediately with code {process.returncode}. "
-                    f"stderr: {stderr_output[:500]}"
-                )
-            status = check_cdp_port(port=port)
-            if status.listening:
-                break
-            await asyncio.sleep(0.2)
-        else:
-            # Timeout -- kill the process and fail
+        # Phase 5: Wait for CDP port to be ready. If the caller cancels this
+        # wait (a wall-clock bound around the launch), the browser must not be
+        # left running unregistered where nothing can find or stop it.
+        try:
+            status = await _wait_for_cdp(process=process, port=port)
+        except asyncio.CancelledError:
             process.kill()
-            raise TimeoutError("Browser did not start within 30 seconds")
+            kill_browser_processes(user_data_dir=session_dir, port=port)
+            raise
 
         # Phase 6: Pin to desktop (Linux/X11, best-effort)
         if pin_to_desktop and not headless:

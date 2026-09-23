@@ -441,13 +441,9 @@ async def _run_login(args: list[str], wait: bool) -> None:
                 result = await run(info)
             else:
                 async with use_lock:
-                    info = await launch_browser(
-                        headless=True, profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+                    result, info = await _checked_headless(
+                        opts=opts, run=run, timeout=timeout, launch_browser=launch_browser, stop=stop,
                     )
-                    result = await run(info)
-                    if not info.reused and not _has_open_pages(info.port):
-                        # stop() drives its own event loop, so run it off this one.
-                        await asyncio.to_thread(stop, info.name)
     except (InstanceNotFoundError, BrowserNotFoundError, ProfileError, RuntimeError, TimeoutError) as exc:
         fail(str(exc))
     result.detail.setdefault("instance", info.name)
@@ -458,6 +454,92 @@ async def _run_login(args: list[str], wait: bool) -> None:
     else:
         print(result.to_json())
     sys.exit(result.exit_code)
+
+
+async def _checked_headless(*, opts, run, timeout, launch_browser, stop):
+    """Start a headless browser, run the check, stop the browser -- bounded.
+
+    ``timeout`` is a wall-clock bound over launch, connect and probe together.
+    A profile heavy with extensions can bring up a headless Chrome whose CDP
+    endpoint never answers; without this bound the command hung for minutes
+    with no output. On expiry the browser this call started is stopped and
+    the result is an error, never a hang.
+    """
+    from .login import ERROR, LoginResult
+
+    info = None
+    launch_done = asyncio.Event()
+
+    async def go():
+        nonlocal info
+        info = await launch_browser(
+            headless=True, profile=opts["--profile"], profile_dir=opts["--profile-dir"],
+        )
+        launch_done.set()
+        return await run(info)
+
+    try:
+        result = await asyncio.wait_for(go(), timeout=timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        phase = "probe" if launch_done.is_set() else "headless launch"
+        result = LoginResult(ERROR, url=opts["--site"], detail={"reason": f"timed out during {phase} after {timeout:g}s"})
+    if info is not None and not info.reused and not _has_open_pages(info.port):
+        if not await _shutdown_own_browser(info):
+            result.detail["cleanup"] = (
+                f"browser for {info.name} on port {info.port} did not exit; run: chrome-agent stop {info.name}"
+            )
+    if info is None:
+        # Launch itself timed out or failed: nothing registered to stop.
+        return result, _Anon()
+    return result, info
+
+
+class _Anon:
+    name = "(not launched)"
+
+
+async def _shutdown_own_browser(info) -> bool:
+    """Stop the browser THIS command started, without ever blocking forever.
+
+    ``registry.stop`` talks to the browser and waits on it; a hung Chrome
+    (seen with a headless profile whose extensions wedged its DevTools
+    server) never answers, so that path cannot be used from a bounded
+    command. This one asks politely once with a short bound, then signals
+    only processes that carry the exact profile directory and port this
+    launch passed, and finally drops the registry entry. Returns True when
+    nothing of the browser is left.
+    """
+    from .cdp_client import CDPClient, get_ws_url
+    from .launcher import browser_processes, kill_browser_processes
+    from .registry import _port_is_listening, deregister
+
+    async def polite_close():
+        ws_url = get_ws_url(port=info.port, target_type="browser")
+        async with CDPClient(ws_url=ws_url) as cdp:
+            await cdp.send(method="Browser.close")
+
+    try:
+        await asyncio.wait_for(polite_close(), timeout=5)
+    except Exception:
+        pass
+
+    def gone() -> bool:
+        # A plain socket check, not an HTTP request: a wedged DevTools server
+        # accepts connections and then never answers.
+        return not _port_is_listening(info.port) and not browser_processes(
+            user_data_dir=info.user_data_dir, port=info.port,
+        )
+
+    for signal_number in (None, 15, 9, 9):
+        for _ in range(10):
+            if gone():
+                deregister(info.name)
+                return True
+            await asyncio.sleep(0.2)
+        if signal_number is not None:
+            kill_browser_processes(user_data_dir=info.user_data_dir, port=info.port, signal_number=signal_number)
+    deregister(info.name)
+    return gone()
 
 
 def _has_open_pages(port: int) -> bool:

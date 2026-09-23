@@ -32,6 +32,7 @@ OK = "ok"
 NEEDS_LOGIN = "needs_login"
 ERROR = "error"
 EXIT_CODES = {OK: 0, NEEDS_LOGIN: 2, ERROR: 3}
+_CDP_TIMEOUT = 10.0  # bound on any single CDP round trip in this module
 
 
 @dataclass
@@ -75,14 +76,16 @@ class _Tab:
     async def open(cls, cdp: CDPClient, url: str, background: bool) -> "_Tab":
         # background=True never activates the tab or raises the window: a
         # check must not steal focus from whatever the machine is doing.
-        created = await cdp.send(
+        # Every send here is bounded: a wedged browser never answers, and an
+        # unbounded await inside a cancelled task's cleanup hangs the command.
+        created = await asyncio.wait_for(cdp.send(
             method="Target.createTarget",
             params={"url": url, "background": background},
-        )
-        attached = await cdp.send(
+        ), timeout=_CDP_TIMEOUT)
+        attached = await asyncio.wait_for(cdp.send(
             method="Target.attachToTarget",
             params={"targetId": created["targetId"], "flatten": True},
-        )
+        ), timeout=_CDP_TIMEOUT)
         tab = cls(cdp, created["targetId"], attached["sessionId"])
         if background:
             # A hidden tab is throttled: Chrome delays its timers by seconds,
@@ -90,11 +93,11 @@ class _Tab:
             # makes this one tab report visible and focused. It is scoped to
             # the tab and does not raise or activate any window.
             try:
-                await cdp.send(
+                await asyncio.wait_for(cdp.send(
                     method="Emulation.setFocusEmulationEnabled",
                     params={"enabled": True}, session_id=tab.session_id,
-                )
-            except CDPError:
+                ), timeout=_CDP_TIMEOUT)
+            except (CDPError, asyncio.TimeoutError, TimeoutError):
                 pass
         return tab
 
@@ -151,14 +154,19 @@ class _Tab:
 
         ``Target.closeTarget`` returns before the target is gone. A caller
         that looks at the browser's tabs next must not still see this one.
+        Bounded as a whole: this runs in ``finally`` blocks, including during
+        cancellation, where an unbounded wait would hang the command.
         """
-        try:
+        async def go():
             await self.cdp.send(method="Target.closeTarget", params={"targetId": self.target_id})
             for _ in range(40):
                 listed = await self.cdp.send(method="Target.getTargets")
                 if all(t["targetId"] != self.target_id for t in listed["targetInfos"]):
                     return
                 await asyncio.sleep(0.05)
+
+        try:
+            await asyncio.wait_for(go(), timeout=_CDP_TIMEOUT)
         except Exception:
             pass
 

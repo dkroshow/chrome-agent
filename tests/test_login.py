@@ -308,3 +308,26 @@ def test_refusal_outside_desktop_session_creates_nothing(tmp_path, monkeypatch, 
         assert exit_info.value.code == 3
         assert json.loads(capsys.readouterr().out)["status"] == "error"
         assert not root.exists()
+
+
+def test_cli_timeout_bounds_the_whole_headless_check(cli, site):
+    """--timeout covers launch + connect + probe, and never leaves a browser."""
+    # Too short for Chrome to even start: times out in the launch phase.
+    early = cli("login-check", "--profile", "slowstart", "--site", f"{site}/app",
+                "--probe-expr", "true", "--timeout", "0.3")
+    assert early.returncode == 3, early.stderr
+    out = json.loads(early.stdout)
+    assert out["status"] == "error" and "headless launch" in out["reason"]
+    if os.path.exists(cli.registry):
+        assert json.loads(open(cli.registry).read() or "{}") == {}
+    # Long enough to launch, too short for a probe that never resolves.
+    late = cli("login-check", "--profile", "slowprobe", "--site", f"{site}/app",
+               "--probe-expr", "new Promise(() => {})", "--timeout", "12")
+    assert late.returncode == 3, late.stderr
+    out = json.loads(late.stdout)
+    assert out["status"] == "error" and "timed out" in out["reason"]
+    assert "cleanup" not in out, out
+    assert json.loads(open(cli.registry).read()) == {}
+    # No Chrome from either run is still around.
+    ps = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True).stdout
+    assert str(cli.root / "profiles") not in ps

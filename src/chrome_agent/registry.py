@@ -768,7 +768,10 @@ def stop(
         try:
             browser_ws = get_ws_url(port=info.port, target_type="browser")
             async with CDPClient(ws_url=browser_ws) as cdp:
-                await cdp.send(method="Browser.close")
+                # A hung browser never answers; without a bound this waited
+                # forever and so did every caller (observed with a headless
+                # profile whose extensions wedged the DevTools server).
+                await asyncio.wait_for(cdp.send(method="Browser.close"), timeout=10)
         except Exception as exc:
             logger.warning("Browser.close failed for %s: %s", instance_name, exc)
             # Verify the target immediately before the destructive fallback:
