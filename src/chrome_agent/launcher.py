@@ -19,7 +19,7 @@ from .connection import check_cdp_port
 from .registry import REGISTRY_PATH, InstanceInfo, allocate_port, register, cleanup
 from .registry import port_lock_path
 from .registry import _load_registry, _resolve_path
-from .utils import browser_processes, kill_browser_processes, process_is_ours, process_is_running, process_start_time
+from .utils import browser_processes, code_sign_clone_snapshot, kill_browser_processes, new_code_sign_clone, process_is_ours, process_is_running, process_start_time, remove_unheld_clone_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +336,9 @@ async def _launch_browser(
         # and every CDP client hangs. The file is read only if Chrome exits
         # during startup, to include its complaint in the error.
         stderr_file = tempfile.TemporaryFile(prefix="chrome-agent-stderr-")
+        # macOS: which code-sign clone this browser creates. We hold the launch
+        # lock, so the one entry that appears while it starts is ours.
+        clones_before = code_sign_clone_snapshot()
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -354,9 +357,13 @@ async def _launch_browser(
         # left running unregistered where nothing can find or stop it.
         try:
             status = await _wait_for_cdp(process=process, port=port)
+        except TimeoutError:
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before)})
+            raise
         except asyncio.CancelledError:
             process.kill()
             kill_browser_processes(user_data_dir=session_dir, port=port)
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before)})
             raise
 
         # Phase 6: Pin to desktop (Linux/X11, best-effort)
@@ -376,6 +383,7 @@ async def _launch_browser(
             registry_path=registry_path,
             pid_start=pid_start,
             headless=headless,
+            code_sign_clone=new_code_sign_clone(clones_before, wait=3.0),
             persistent=resolved is not None,
             profile=resolved.name if resolved is not None else None,
         )

@@ -22,7 +22,7 @@ from chrome_agent.launcher import find_chrome_binary, launch_browser
 from chrome_agent.login import ERROR, NEEDS_LOGIN, OK, classify, login_check, same_site, wait_for_login
 from chrome_agent.registry import stop
 
-PORT = 9362
+PORT = 9358  # 9362 was taken by an unrelated SSH forward on this machine
 
 PROBE = """
 fetch('/api/me').then(r => r.status === 200
@@ -163,7 +163,7 @@ def test_probe_errors_and_timeouts_are_errors(browser, site):
         port=PORT, url=f"{site}/app", probe="new Promise(() => {})", timeout=1.5,
     ))
     assert (hang.status, hang.detail) == (ERROR, {"reason": "timed out"})
-    nobody = asyncio.run(login_check(port=9363, url=f"{site}/app", probe="true"))
+    nobody = asyncio.run(login_check(port=9359, url=f"{site}/app", probe="true"))
     assert nobody.status == ERROR
 
 

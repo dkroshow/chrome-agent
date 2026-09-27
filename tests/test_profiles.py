@@ -778,3 +778,28 @@ def test_clone_self_and_existing_refuse_promptly(isolated):
         )
         assert proc.returncode == 1 and ("itself" in proc.stderr or "already exists" in proc.stderr), proc.stderr
         assert time.monotonic() - t0 < 5
+
+
+@needs_chrome
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS code-sign clones only")
+def test_forced_kill_leaves_no_code_sign_clone(isolated):
+    """A killed Chrome cannot delete its code-sign clone; chrome-agent must."""
+    import signal
+    from chrome_agent.utils import code_sign_clone_root, code_sign_clone_snapshot
+
+    root = code_sign_clone_root()
+    if root is None:
+        pytest.skip("no code-sign clone directory yet")
+    before = code_sign_clone_snapshot()
+    info = asyncio.run(_launch(isolated, PORT_A, profile="clonekill"))
+    assert info.code_sign_clone and os.path.isdir(info.code_sign_clone)
+    assert info.code_sign_clone not in before
+    assert lookup(info.name, registry_path=isolated["registry"]).code_sign_clone == info.code_sign_clone
+    os.kill(info.pid, signal.SIGSTOP)  # wedged: Browser.close and SIGTERM are ignored
+    try:
+        _stop(isolated, info.name)
+    finally:
+        with contextlib_suppress():
+            os.kill(info.pid, signal.SIGKILL)
+    assert not os.path.isdir(info.code_sign_clone)
+    assert code_sign_clone_snapshot() <= before

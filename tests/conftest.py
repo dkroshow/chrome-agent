@@ -56,3 +56,17 @@ def browser_session(event_loop, tmp_path_factory):
 def fixture_url():
     """URL to the test fixture page."""
     return f"file://{FIXTURE_PATH.resolve()}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def sweep_code_sign_clones_left_by_tests():
+    """Tests kill Chrome on purpose; remove the code-sign clones those kills leave.
+
+    Only entries that appear during this test session and that no process
+    holds at the end are removed. Nothing that existed before is touched.
+    """
+    from chrome_agent.utils import code_sign_clone_snapshot, remove_unheld_clone_dirs
+
+    before = code_sign_clone_snapshot()
+    yield
+    remove_unheld_clone_dirs(code_sign_clone_snapshot() - before, timeout=60)

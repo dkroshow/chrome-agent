@@ -186,3 +186,93 @@ def kill_browser_processes(user_data_dir: str, port: int, signal_number: int = 9
         except ProcessLookupError:
             pass
     return hit
+
+
+# --- macOS code-sign clones -------------------------------------------------
+# At startup Chrome on macOS clones its own app bundle (APFS clonefile) under
+# the user's temp area so code-signature checks keep working if the app is
+# updated in place while running. A normal shutdown deletes the clone; a
+# killed Chrome cannot, and Chrome never sweeps old ones. Every forced kill
+# chrome-agent performs would therefore leave a 2 GiB-apparent directory
+# behind. chrome-agent attributes the clone to its browser at launch (the one
+# entry that appears while it starts, under the launch lock) and removes it
+# after a forced kill once nothing holds it.
+
+_CLONE_DIRNAME = "com.google.Chrome.code_sign_clone"
+
+
+def code_sign_clone_root() -> str | None:
+    """Chrome's clone directory for this user (macOS), or None."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        tmp = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not tmp:
+        return None
+    root = os.path.join(os.path.dirname(tmp.rstrip("/")), "X", _CLONE_DIRNAME)
+    return root if os.path.isdir(root) else None
+
+
+def code_sign_clone_snapshot() -> set[str]:
+    root = code_sign_clone_root()
+    if not root:
+        return set()
+    try:
+        return {os.path.join(root, e) for e in os.listdir(root) if e.startswith("code_sign_clone.")}
+    except OSError:
+        return set()
+
+
+def new_code_sign_clone(before: set[str], wait: float = 0.0) -> str | None:
+    """The single clone entry that appeared since ``before``, or None if 0 or >1.
+
+    Chrome creates the clone shortly after startup, sometimes after its CDP
+    port is already up, so callers at launch pass a short ``wait``. Ambiguity
+    (another Chrome starting in the same window) yields None: better to leak
+    one directory than to delete a clone that is not ours.
+    """
+    import time
+
+    if code_sign_clone_root() is None:
+        return None
+    deadline = time.monotonic() + wait
+    while True:
+        new = code_sign_clone_snapshot() - before
+        if len(new) == 1:
+            return new.pop()
+        if len(new) > 1 or time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+def remove_unheld_clone_dirs(dirs, timeout: float = 10.0) -> list[str]:
+    """Delete clone directories once no process holds files in them.
+
+    Only directories attributed to a browser chrome-agent itself launched and
+    then killed are passed here, and each is re-checked for holders right
+    before removal, so a clone another browser relies on is never touched.
+    """
+    import shutil
+    import time
+
+    root = code_sign_clone_root()
+    removed = []
+    deadline = time.monotonic() + timeout
+    pending = {d for d in dirs if d and root and os.path.dirname(d) == root and os.path.isdir(d)}
+    while pending and time.monotonic() < deadline:
+        for d in list(pending):
+            try:
+                holders = subprocess.run(["lsof", "-nP", "-t", "+D", d], capture_output=True, text=True, timeout=60).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                holders = "unknown"
+            if holders:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            if not os.path.exists(d):
+                removed.append(d)
+            pending.discard(d)
+        if pending:
+            time.sleep(0.5)
+    return removed

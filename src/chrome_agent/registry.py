@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .utils import browser_processes, kill_browser_processes, process_is_ours
+from .utils import browser_processes, kill_browser_processes, process_is_ours, remove_unheld_clone_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,10 @@ class InstanceInfo:
     # Recorded at launch. Chrome's new headless mode reports an ordinary
     # version string, so this cannot be recovered from the browser later.
     headless: bool = False
+    # macOS: the code-sign clone directory Chrome made for this browser, when
+    # it could be attributed unambiguously at launch. Removed after a forced
+    # kill (a killed Chrome cannot remove it itself).
+    code_sign_clone: str | None = None
 
 
 class StopIncomplete(RuntimeError):
@@ -466,6 +470,7 @@ def _entry_info(name: str, entry: dict, alive: bool = True) -> InstanceInfo:
         profile=entry.get("profile"),
         persistent=bool(entry.get("profile_dir")),
         headless=_entry_is_headless(entry),
+        code_sign_clone=entry.get("code_sign_clone"),
     )
 
 
@@ -501,6 +506,7 @@ def register(
     persistent: bool = False,
     profile: str | None = None,
     headless: bool = False,
+    code_sign_clone: str | None = None,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
@@ -513,6 +519,7 @@ def register(
             user_data_dir=user_data_dir, port_override=port_override,
             registry_path=registry_path, pid_start=pid_start,
             persistent=persistent, profile=profile, headless=headless,
+            code_sign_clone=code_sign_clone,
         )
 
 
@@ -527,6 +534,7 @@ def _register_locked(
     persistent: bool = False,
     profile: str | None = None,
     headless: bool = False,
+    code_sign_clone: str | None = None,
 ) -> InstanceInfo:
     """Register a new browser instance in the registry.
 
@@ -558,6 +566,8 @@ def _register_locked(
         "pid_start": pid_start,
     }
     registry[instance_name]["headless"] = headless
+    if code_sign_clone:
+        registry[instance_name]["code_sign_clone"] = code_sign_clone
     if persistent:
         registry[instance_name]["profile_dir"] = user_data_dir
         registry[instance_name]["profile"] = profile
@@ -575,6 +585,7 @@ def _register_locked(
         profile=profile,
         persistent=persistent,
         headless=headless,
+        code_sign_clone=code_sign_clone,
     )
 
 
@@ -766,6 +777,10 @@ def stop(
         logger.info("%s", outcome)
         return outcome
 
+    # Set when we end the browser by force; a killed Chrome cannot remove its
+    # own code-sign clone, so we remove the one recorded for it at launch.
+    forced = False
+
     # Close the entire browser via Browser.close
     async def _close_browser():
         from .cdp_client import CDPClient, get_ws_url
@@ -783,6 +798,7 @@ def stop(
             # stale or namespace-local PID may alias to an unrelated process
             # (even a root kernel thread) that must never be signalled.
             if process_is_ours(pid=info.pid, expected_start=info.pid_start):
+                forced = True
                 try:
                     os.kill(info.pid, 15)  # SIGTERM fallback
                 except ProcessLookupError:
@@ -807,6 +823,7 @@ def stop(
         # Still our verified process after Browser.close and SIGTERM: a wedged
         # browser ignores both. Deregistering it now would orphan a live
         # Chrome nothing can find, so escalate to SIGKILL and wait again.
+        forced = True
         try:
             os.kill(info.pid, 9)
         except ProcessLookupError:
@@ -827,6 +844,7 @@ def stop(
         for signal_number in (15, 9, 9):
             if not browser_processes(user_data_dir=browser_dir, port=info.port) and not _port_is_listening(info.port):
                 break
+            forced = True
             kill_browser_processes(user_data_dir=browser_dir, port=info.port, signal_number=signal_number)
             deadline = time.monotonic() + 3.0
             while time.monotonic() < deadline and browser_processes(user_data_dir=browser_dir, port=info.port):
@@ -840,6 +858,9 @@ def stop(
             f"be verified as stopped; the registry entry is kept. Inspect it with "
             f"'chrome-agent status {instance_name}' and stop it by hand if it is yours."
         )
+
+    if forced and info.code_sign_clone:
+        remove_unheld_clone_dirs({info.code_sign_clone})
 
     # Clean up registry entry and session directory
     entry = _pop_entry(instance_name, path)

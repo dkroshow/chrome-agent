@@ -510,7 +510,7 @@ async def _shutdown_own_browser(info) -> bool:
     nothing of the browser is left.
     """
     from .cdp_client import CDPClient, get_ws_url
-    from .utils import browser_processes, kill_browser_processes
+    from .utils import browser_processes, kill_browser_processes, remove_unheld_clone_dirs
     from .registry import _port_is_listening, deregister
 
     async def polite_close():
@@ -530,13 +530,17 @@ async def _shutdown_own_browser(info) -> bool:
             user_data_dir=info.user_data_dir, port=info.port,
         )
 
+    forced = False
     for signal_number in (None, 15, 9, 9):
         for _ in range(10):
             if gone():
+                if forced and getattr(info, "code_sign_clone", None):
+                    remove_unheld_clone_dirs({info.code_sign_clone})
                 deregister(info.name)
                 return True
             await asyncio.sleep(0.2)
         if signal_number is not None:
+            forced = True
             kill_browser_processes(user_data_dir=info.user_data_dir, port=info.port, signal_number=signal_number)
     deregister(info.name)
     return gone()
