@@ -157,6 +157,22 @@ async def _async_flock(lock_file: str):
         os.close(fd)
 
 
+def _remove_clone_of_killed_launch(process, session_dir: str, port: int, clones_before, mains_before) -> None:
+    """After killing a launch we own, remove the clone it created, if certain.
+
+    The clone can appear a moment after the kill, and a killed child stays
+    visible to ``kill(pid, 0)`` until it is reaped: ``wait()`` first, so the
+    "gone" check sees the truth.
+    """
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    own = lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}
+    clone = new_code_sign_clone(clones_before, mains_before, own, wait=2.0)
+    remove_unheld_clone_dirs({clone}, browser_gone(process.pid, session_dir, port), timeout=15.0)
+
+
 async def _wait_for_cdp(process, port: int):
     """Poll until the browser's CDP port listens; raise if it dies or stalls."""
     deadline = asyncio.get_event_loop().time() + 30.0
@@ -338,8 +354,12 @@ async def _launch_browser(
         stderr_file = tempfile.TemporaryFile(prefix="chrome-agent-stderr-")
         # macOS: which code-sign clone this browser creates. We hold the launch
         # lock, so the one entry that appears while it starts is ours.
-        clones_before = code_sign_clone_snapshot()
+        # Order matters: read the browser set first, then the clone set. A
+        # foreign Chrome starting between the two reads then shows up as a new
+        # main process (and disqualifies attribution) rather than hiding in the
+        # "before" set while its clone looks new.
         mains_before = chrome_main_pids()
+        clones_before = code_sign_clone_snapshot()
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -359,16 +379,12 @@ async def _launch_browser(
         try:
             status = await _wait_for_cdp(process=process, port=port)
         except TimeoutError:
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, mains_before, lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}, wait=2.0)},
-                                     browser_gone(process.pid, session_dir, port), timeout=15.0)
+            _remove_clone_of_killed_launch(process, session_dir, port, clones_before, mains_before)
             raise
         except asyncio.CancelledError:
             process.kill()
             kill_browser_processes(user_data_dir=session_dir, port=port)
-            # The clone can appear a moment after the kill; give it time to
-            # show and the killed processes time to exit before removing it.
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, mains_before, lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}, wait=2.0)},
-                                     browser_gone(process.pid, session_dir, port), timeout=15.0)
+            _remove_clone_of_killed_launch(process, session_dir, port, clones_before, mains_before)
             raise
 
         # Phase 6: Pin to desktop (Linux/X11, best-effort)

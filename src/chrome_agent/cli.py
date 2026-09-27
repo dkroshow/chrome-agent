@@ -543,6 +543,9 @@ async def _shutdown_own_browser(info) -> bool:
         if signal_number is not None:
             forced = True
             kill_browser_processes(user_data_dir=info.user_data_dir, port=info.port, signal_number=signal_number)
+    if forced and getattr(info, "code_sign_clone", None):
+        remove_unheld_clone_dirs({info.code_sign_clone},
+                                 browser_gone(info.pid, info.user_data_dir, info.port), timeout=15.0)
     deregister(info.name)
     return gone()
 
