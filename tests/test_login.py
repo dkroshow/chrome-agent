@@ -331,3 +331,39 @@ def test_cli_timeout_bounds_the_whole_headless_check(cli, site):
     # No Chrome from either run is still around.
     ps = subprocess.run(["ps", "-axo", "command"], capture_output=True, text=True).stdout
     assert str(cli.root / "profiles") not in ps
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS code-sign clones only")
+def test_fail_safe_final_kill_removes_clone(tmp_path, monkeypatch, site):
+    """login-check's fail-safe: a wedged browser killed on the final round leaves no clone."""
+    import signal
+    from chrome_agent import cli as cli_module, launcher, utils
+    from chrome_agent.registry import stop
+
+    if utils.code_sign_clone_root() is None:
+        pytest.skip("no code-sign clone directory yet")
+    monkeypatch.setenv("CHROME_AGENT_PROFILE_ROOT", str(tmp_path / "profiles"))
+    (tmp_path / "sessions").mkdir()
+    monkeypatch.setattr(launcher, "_SESSION_ROOT", str(tmp_path / "sessions"))
+    registry = str(tmp_path / "registry.json")
+    monkeypatch.setattr(launcher, "REGISTRY_PATH", registry)
+    from chrome_agent import registry as registry_module
+    monkeypatch.setattr(registry_module, "REGISTRY_PATH", registry)
+
+    before = utils.code_sign_clone_snapshot()
+    info = asyncio.run(launch_browser(port_override=PORT, headless=True, pin_to_desktop=False,
+                                      registry_path=registry, profile="failsafe"))
+    try:
+        if not (utils.code_sign_clone_snapshot() - before):
+            pytest.skip("this Chrome launch created no code-sign clone")
+        assert info.code_sign_clone
+        os.kill(info.pid, signal.SIGSTOP)  # ignores Browser.close and SIGTERM; only SIGKILL ends it
+        assert asyncio.run(cli_module._shutdown_own_browser(info)) is True
+        assert not os.path.isdir(info.code_sign_clone)
+        assert utils.code_sign_clone_snapshot() <= before
+    finally:
+        for action in (lambda: os.kill(info.pid, signal.SIGKILL), lambda: stop(info.name, registry_path=registry)):
+            try:
+                action()
+            except Exception:
+                pass

@@ -303,8 +303,35 @@ def remove_unheld_clone_dirs(dirs, gone, timeout: float = 10.0) -> list[str]:
     return removed
 
 
+def _reap_if_child(pid: int) -> None:
+    """Collect ``pid`` if it is a dead child of this process.
+
+    A killed child stays visible to ``kill(pid, 0)`` as a zombie until its
+    parent waits for it. Paths that hold no Popen handle (the login-check
+    fail-safe, which killed a browser launched in this same process) must
+    still reap, or the zombie looks alive for the whole cleanup window.
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass  # not our child, or already reaped
+    except OSError:
+        pass
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return stat.startswith("Z")
+
+
 def browser_gone(pid: int, user_data_dir: str, port: int):
     """A ``gone`` predicate for ``remove_unheld_clone_dirs``."""
     def check() -> bool:
-        return not process_is_running(pid=pid) and not browser_processes(user_data_dir=user_data_dir, port=port)
+        _reap_if_child(pid)
+        main_gone = not process_is_running(pid=pid) or _is_zombie(pid)
+        live = [p for p in browser_processes(user_data_dir=user_data_dir, port=port) if not _is_zombie(p)]
+        return main_gone and not live
     return check
