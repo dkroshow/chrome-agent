@@ -535,7 +535,7 @@ async def _shutdown_own_browser(info) -> bool:
         for _ in range(10):
             if gone():
                 if forced and getattr(info, "code_sign_clone", None):
-                    remove_unheld_clone_dirs({info.code_sign_clone})
+                    remove_unheld_clone_dirs({info.code_sign_clone}, timeout=15.0)
                 deregister(info.name)
                 return True
             await asyncio.sleep(0.2)

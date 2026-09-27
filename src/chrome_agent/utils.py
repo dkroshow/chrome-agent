@@ -247,12 +247,35 @@ def new_code_sign_clone(before: set[str], wait: float = 0.0) -> str | None:
         time.sleep(0.1)
 
 
+# Files a running Chrome maps from its clone (seen as lsof 'txt' entries).
+# Checking these two paths takes well under a second; walking the whole
+# 2 GiB bundle with 'lsof +D' takes ~9 s and made stop() miss its deadlines.
+_CLONE_MAPPED_FILES = (
+    "Google Chrome.app.bundle/Contents/MacOS/Google Chrome",
+    "Google Chrome.app.bundle/Contents/Frameworks/Google Chrome Framework.framework/Versions/Current/Google Chrome Framework",
+)
+
+
+def _clone_holders(clone_dir: str, timeout: float) -> str:
+    """PIDs holding the clone's executables open, '' if none, 'unknown' on failure."""
+    paths = [os.path.join(clone_dir, rel) for rel in _CLONE_MAPPED_FILES]
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
+        return ""
+    try:
+        return subprocess.run(["lsof", "-nP", "-t", "--", *paths], capture_output=True, text=True,
+                              timeout=max(1.0, timeout)).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def remove_unheld_clone_dirs(dirs, timeout: float = 10.0) -> list[str]:
-    """Delete clone directories once no process holds files in them.
+    """Delete clone directories once no process maps their executables.
 
     Only directories attributed to a browser chrome-agent itself launched and
     then killed are passed here, and each is re-checked for holders right
     before removal, so a clone another browser relies on is never touched.
+    ``timeout`` bounds the whole call, including the holder checks.
     """
     import shutil
     import time
@@ -261,12 +284,12 @@ def remove_unheld_clone_dirs(dirs, timeout: float = 10.0) -> list[str]:
     removed = []
     deadline = time.monotonic() + timeout
     pending = {d for d in dirs if d and root and os.path.dirname(d) == root and os.path.isdir(d)}
-    while pending and time.monotonic() < deadline:
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         for d in list(pending):
-            try:
-                holders = subprocess.run(["lsof", "-nP", "-t", "+D", d], capture_output=True, text=True, timeout=60).stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                holders = "unknown"
+            holders = _clone_holders(d, timeout=remaining)
             if holders:
                 continue
             shutil.rmtree(d, ignore_errors=True)
@@ -274,5 +297,5 @@ def remove_unheld_clone_dirs(dirs, timeout: float = 10.0) -> list[str]:
                 removed.append(d)
             pending.discard(d)
         if pending:
-            time.sleep(0.5)
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
     return removed

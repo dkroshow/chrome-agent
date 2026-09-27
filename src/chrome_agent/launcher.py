@@ -358,12 +358,14 @@ async def _launch_browser(
         try:
             status = await _wait_for_cdp(process=process, port=port)
         except TimeoutError:
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before)})
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, wait=2.0)}, timeout=15.0)
             raise
         except asyncio.CancelledError:
             process.kill()
             kill_browser_processes(user_data_dir=session_dir, port=port)
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before)})
+            # The clone can appear a moment after the kill; give it time to
+            # show and the killed processes time to exit before removing it.
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, wait=2.0)}, timeout=15.0)
             raise
 
         # Phase 6: Pin to desktop (Linux/X11, best-effort)

@@ -803,3 +803,47 @@ def test_forced_kill_leaves_no_code_sign_clone(isolated):
             os.kill(info.pid, signal.SIGKILL)
     assert not os.path.isdir(info.code_sign_clone)
     assert code_sign_clone_snapshot() <= before
+
+
+@needs_chrome
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS code-sign clones only")
+def test_cancelled_launch_leaves_no_code_sign_clone(isolated):
+    from chrome_agent.utils import code_sign_clone_root, code_sign_clone_snapshot
+
+    if code_sign_clone_root() is None:
+        pytest.skip("no code-sign clone directory yet")
+    before = code_sign_clone_snapshot()
+
+    async def cancelled() -> bool:
+        try:
+            info = await asyncio.wait_for(_launch(isolated, PORT_A, profile="cancelled"), timeout=0.4)
+        except asyncio.TimeoutError:
+            return True
+        _stop(isolated, info.name)  # Chrome was faster than the bound this time
+        return False
+
+    if not asyncio.run(cancelled()):
+        pytest.skip("launch finished before the cancellation bound; nothing to test")
+    for _ in range(50):
+        if code_sign_clone_snapshot() <= before:
+            break
+        asyncio.run(asyncio.sleep(0.2))
+    assert code_sign_clone_snapshot() <= before
+    assert not launcher.browser_processes(user_data_dir=os.path.join(isolated["root"], "cancelled"), port=PORT_A)
+
+
+def test_remove_unheld_clone_dirs_honours_timeout(monkeypatch, tmp_path):
+    import time
+    from chrome_agent import utils
+
+    root = tmp_path / "X" / "com.google.Chrome.code_sign_clone"
+    d = root / "code_sign_clone.abc"
+    (d / "Google Chrome.app.bundle" / "Contents" / "MacOS").mkdir(parents=True)
+    (d / "Google Chrome.app.bundle" / "Contents" / "MacOS" / "Google Chrome").write_text("x")
+    monkeypatch.setattr(utils, "code_sign_clone_root", lambda: str(root))
+    monkeypatch.setattr(utils, "_clone_holders", lambda clone_dir, timeout: "12345")  # always held
+    t0 = time.monotonic()
+    assert utils.remove_unheld_clone_dirs({str(d)}, timeout=1.0) == []
+    assert time.monotonic() - t0 < 2.5 and d.exists()
+    monkeypatch.setattr(utils, "_clone_holders", lambda clone_dir, timeout: "")
+    assert utils.remove_unheld_clone_dirs({str(d)}, timeout=1.0) == [str(d)] and not d.exists()

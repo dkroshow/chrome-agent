@@ -760,6 +760,8 @@ def stop(
                 if not process_is_ours(pid=info.pid, expected_start=info.pid_start):
                     break
                 time.sleep(0.1)
+            if info.code_sign_clone:
+                remove_unheld_clone_dirs({info.code_sign_clone}, timeout=15.0)
             outcome = (
                 f"Stopped {instance_name} (terminated by PID; port {info.port} "
                 f"was serving a different browser)"
@@ -860,7 +862,9 @@ def stop(
         )
 
     if forced and info.code_sign_clone:
-        remove_unheld_clone_dirs({info.code_sign_clone})
+        # Helpers can outlive the main process for a moment; the holder check
+        # inside waits for them, bounded.
+        remove_unheld_clone_dirs({info.code_sign_clone}, timeout=15.0)
 
     # Clean up registry entry and session directory
     entry = _pop_entry(instance_name, path)
