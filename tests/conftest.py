@@ -65,8 +65,12 @@ def sweep_code_sign_clones_left_by_tests():
     Only entries that appear during this test session and that no process
     holds at the end are removed. Nothing that existed before is touched.
     """
-    from chrome_agent.utils import code_sign_clone_snapshot, remove_unheld_clone_dirs
+    from chrome_agent.utils import chrome_main_pids, code_sign_clone_snapshot, remove_unheld_clone_dirs
 
     before = code_sign_clone_snapshot()
+    mains_before = chrome_main_pids()
     yield
-    remove_unheld_clone_dirs(code_sign_clone_snapshot() - before, timeout=60)
+    # Safe only when every browser that started during the session is gone:
+    # then any new clone entry is an orphan a killed test browser left.
+    remove_unheld_clone_dirs(code_sign_clone_snapshot() - before,
+                             gone=lambda: not (chrome_main_pids() - mains_before), timeout=60)

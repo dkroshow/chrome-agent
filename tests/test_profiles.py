@@ -665,7 +665,7 @@ def test_stop_kills_a_browser_that_ignores_close_and_term(isolated):
 
 def contextlib_suppress():
     import contextlib
-    return contextlib.suppress(ProcessLookupError)
+    return contextlib.suppress(Exception)
 
 
 def test_linux_cmdline_flattened_is_unknown():
@@ -792,17 +792,24 @@ def test_forced_kill_leaves_no_code_sign_clone(isolated):
         pytest.skip("no code-sign clone directory yet")
     before = code_sign_clone_snapshot()
     info = asyncio.run(_launch(isolated, PORT_A, profile="clonekill"))
-    assert info.code_sign_clone and os.path.isdir(info.code_sign_clone)
-    assert info.code_sign_clone not in before
-    assert lookup(info.name, registry_path=isolated["registry"]).code_sign_clone == info.code_sign_clone
-    os.kill(info.pid, signal.SIGSTOP)  # wedged: Browser.close and SIGTERM are ignored
     try:
+        created = code_sign_clone_snapshot() - before
+        if not created:
+            # Chrome does not create a clone on every launch (field-trial
+            # controlled); then there is nothing to leak and nothing to test.
+            pytest.skip("this Chrome launch created no code-sign clone")
+        assert info.code_sign_clone and os.path.isdir(info.code_sign_clone)
+        assert info.code_sign_clone in created
+        assert lookup(info.name, registry_path=isolated["registry"]).code_sign_clone == info.code_sign_clone
+        os.kill(info.pid, signal.SIGSTOP)  # wedged: Browser.close and SIGTERM are ignored
         _stop(isolated, info.name)
+        assert not os.path.isdir(info.code_sign_clone)
+        assert code_sign_clone_snapshot() <= before
     finally:
         with contextlib_suppress():
             os.kill(info.pid, signal.SIGKILL)
-    assert not os.path.isdir(info.code_sign_clone)
-    assert code_sign_clone_snapshot() <= before
+        with contextlib_suppress():
+            _stop(isolated, info.name)
 
 
 @needs_chrome
@@ -838,12 +845,27 @@ def test_remove_unheld_clone_dirs_honours_timeout(monkeypatch, tmp_path):
 
     root = tmp_path / "X" / "com.google.Chrome.code_sign_clone"
     d = root / "code_sign_clone.abc"
-    (d / "Google Chrome.app.bundle" / "Contents" / "MacOS").mkdir(parents=True)
-    (d / "Google Chrome.app.bundle" / "Contents" / "MacOS" / "Google Chrome").write_text("x")
+    d.mkdir(parents=True)
+    (d / "marker").write_text("x")
     monkeypatch.setattr(utils, "code_sign_clone_root", lambda: str(root))
-    monkeypatch.setattr(utils, "_clone_holders", lambda clone_dir, timeout: "12345")  # always held
     t0 = time.monotonic()
-    assert utils.remove_unheld_clone_dirs({str(d)}, timeout=1.0) == []
+    assert utils.remove_unheld_clone_dirs({str(d)}, gone=lambda: False, timeout=1.0) == []
     assert time.monotonic() - t0 < 2.5 and d.exists()
-    monkeypatch.setattr(utils, "_clone_holders", lambda clone_dir, timeout: "")
-    assert utils.remove_unheld_clone_dirs({str(d)}, timeout=1.0) == [str(d)] and not d.exists()
+    assert utils.remove_unheld_clone_dirs({str(d)}, gone=lambda: True, timeout=1.0) == [str(d)] and not d.exists()
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    assert utils.remove_unheld_clone_dirs({str(other)}, gone=lambda: True, timeout=1.0) == [] and other.exists()
+
+
+def test_new_code_sign_clone_refuses_ambiguity(monkeypatch, tmp_path):
+    from chrome_agent import utils
+
+    root = tmp_path / "X" / "com.google.Chrome.code_sign_clone"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(utils, "code_sign_clone_root", lambda: str(root))
+    (root / "code_sign_clone.one").mkdir()
+    monkeypatch.setattr(utils, "chrome_main_pids", lambda: {100, 200})
+    assert utils.new_code_sign_clone(set(), mains_before={100}, own_pids={300}) is None
+    assert utils.new_code_sign_clone(set(), mains_before={100}, own_pids=lambda: {200}) == str(root / "code_sign_clone.one")
+    (root / "code_sign_clone.two").mkdir()
+    assert utils.new_code_sign_clone(set(), mains_before={100}, own_pids={200}) is None

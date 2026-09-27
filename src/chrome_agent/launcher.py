@@ -19,7 +19,7 @@ from .connection import check_cdp_port
 from .registry import REGISTRY_PATH, InstanceInfo, allocate_port, register, cleanup
 from .registry import port_lock_path
 from .registry import _load_registry, _resolve_path
-from .utils import browser_processes, code_sign_clone_snapshot, kill_browser_processes, new_code_sign_clone, process_is_ours, process_is_running, process_start_time, remove_unheld_clone_dirs
+from .utils import browser_gone, browser_processes, chrome_main_pids, code_sign_clone_snapshot, kill_browser_processes, new_code_sign_clone, process_is_ours, process_is_running, process_start_time, remove_unheld_clone_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +339,7 @@ async def _launch_browser(
         # macOS: which code-sign clone this browser creates. We hold the launch
         # lock, so the one entry that appears while it starts is ours.
         clones_before = code_sign_clone_snapshot()
+        mains_before = chrome_main_pids()
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -358,14 +359,16 @@ async def _launch_browser(
         try:
             status = await _wait_for_cdp(process=process, port=port)
         except TimeoutError:
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, wait=2.0)}, timeout=15.0)
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, mains_before, lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}, wait=2.0)},
+                                     browser_gone(process.pid, session_dir, port), timeout=15.0)
             raise
         except asyncio.CancelledError:
             process.kill()
             kill_browser_processes(user_data_dir=session_dir, port=port)
             # The clone can appear a moment after the kill; give it time to
             # show and the killed processes time to exit before removing it.
-            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, wait=2.0)}, timeout=15.0)
+            remove_unheld_clone_dirs({new_code_sign_clone(clones_before, mains_before, lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}, wait=2.0)},
+                                     browser_gone(process.pid, session_dir, port), timeout=15.0)
             raise
 
         # Phase 6: Pin to desktop (Linux/X11, best-effort)
@@ -385,7 +388,7 @@ async def _launch_browser(
             registry_path=registry_path,
             pid_start=pid_start,
             headless=headless,
-            code_sign_clone=new_code_sign_clone(clones_before, wait=3.0),
+            code_sign_clone=new_code_sign_clone(clones_before, mains_before, lambda: {process.pid, *browser_processes(user_data_dir=session_dir, port=port)}, wait=3.0),
             persistent=resolved is not None,
             profile=resolved.name if resolved is not None else None,
         )

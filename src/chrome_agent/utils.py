@@ -225,13 +225,35 @@ def code_sign_clone_snapshot() -> set[str]:
         return set()
 
 
-def new_code_sign_clone(before: set[str], wait: float = 0.0) -> str | None:
-    """The single clone entry that appeared since ``before``, or None if 0 or >1.
+def chrome_main_pids() -> set[int]:
+    """PIDs of browser main processes (Chrome/Chromium binaries, no --type=)."""
+    found = set()
+    for pid in _candidate_pids():
+        argv = process_argv(pid)
+        if not argv:
+            continue
+        # The browser binary itself, not helpers such as chrome_crashpad_handler
+        # that live under the same bundle path.
+        name = os.path.basename(argv[0])
+        if name in ("Google Chrome", "Google Chrome Beta", "Google Chrome Canary", "Chromium",
+                    "chrome", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser") \
+                and not any(a.startswith("--type=") for a in argv):
+            found.add(pid)
+    return found
+
+
+def new_code_sign_clone(before: set[str], mains_before: set[int], own_pids,
+                        wait: float = 0.0) -> str | None:
+    """The clone entry our browser created, or None when that is not certain.
 
     Chrome creates the clone shortly after startup, sometimes after its CDP
-    port is already up, so callers at launch pass a short ``wait``. Ambiguity
-    (another Chrome starting in the same window) yields None: better to leak
-    one directory than to delete a clone that is not ours.
+    port is already up, so callers at launch pass a short ``wait``. Certainty
+    means: exactly one new entry appeared, and no browser main process other
+    than ours started in the same window. ``own_pids`` is the launched pid
+    plus every process carrying our exact launch arguments (on macOS the
+    launched process can hand off to a child); a callable is re-evaluated at
+    check time. Otherwise None: better to leak one directory than to delete a
+    clone that is not ours.
     """
     import time
 
@@ -240,62 +262,49 @@ def new_code_sign_clone(before: set[str], wait: float = 0.0) -> str | None:
     deadline = time.monotonic() + wait
     while True:
         new = code_sign_clone_snapshot() - before
+        if len(new) > 1:
+            return None
         if len(new) == 1:
-            return new.pop()
-        if len(new) > 1 or time.monotonic() >= deadline:
+            ours = set(own_pids() if callable(own_pids) else own_pids)
+            others = chrome_main_pids() - mains_before - ours
+            return None if others else new.pop()
+        if time.monotonic() >= deadline:
             return None
         time.sleep(0.1)
 
 
-# Files a running Chrome maps from its clone (seen as lsof 'txt' entries).
-# Checking these two paths takes well under a second; walking the whole
-# 2 GiB bundle with 'lsof +D' takes ~9 s and made stop() miss its deadlines.
-_CLONE_MAPPED_FILES = (
-    "Google Chrome.app.bundle/Contents/MacOS/Google Chrome",
-    "Google Chrome.app.bundle/Contents/Frameworks/Google Chrome Framework.framework/Versions/Current/Google Chrome Framework",
-)
+def remove_unheld_clone_dirs(dirs, gone, timeout: float = 10.0) -> list[str]:
+    """Delete attributed clone directories once ``gone()`` says our browser is out.
 
-
-def _clone_holders(clone_dir: str, timeout: float) -> str:
-    """PIDs holding the clone's executables open, '' if none, 'unknown' on failure."""
-    paths = [os.path.join(clone_dir, rel) for rel in _CLONE_MAPPED_FILES]
-    paths = [p for p in paths if os.path.exists(p)]
-    if not paths:
-        return ""
-    try:
-        return subprocess.run(["lsof", "-nP", "-t", "--", *paths], capture_output=True, text=True,
-                              timeout=max(1.0, timeout)).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-
-
-def remove_unheld_clone_dirs(dirs, timeout: float = 10.0) -> list[str]:
-    """Delete clone directories once no process maps their executables.
-
-    Only directories attributed to a browser chrome-agent itself launched and
-    then killed are passed here, and each is re-checked for holders right
-    before removal, so a clone another browser relies on is never touched.
-    ``timeout`` bounds the whole call, including the holder checks.
+    ``gone`` is the caller's cheap check that the browser the clone belongs to
+    has fully exited (recorded pid dead and no process carrying its exact
+    launch arguments). The clone was attributed to that browser at launch, so
+    nothing else uses it. No lsof: on a loaded machine one lsof call takes
+    ~10 s, which is what made the earlier version miss its deadlines.
+    ``timeout`` bounds the wait for ``gone()``.
     """
     import shutil
     import time
 
     root = code_sign_clone_root()
-    removed = []
-    deadline = time.monotonic() + timeout
     pending = {d for d in dirs if d and root and os.path.dirname(d) == root and os.path.isdir(d)}
-    while pending:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        for d in list(pending):
-            holders = _clone_holders(d, timeout=remaining)
-            if holders:
-                continue
-            shutil.rmtree(d, ignore_errors=True)
-            if not os.path.exists(d):
-                removed.append(d)
-            pending.discard(d)
-        if pending:
-            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    if not pending:
+        return []
+    deadline = time.monotonic() + timeout
+    while not gone():
+        if time.monotonic() >= deadline:
+            return []
+        time.sleep(0.2)
+    removed = []
+    for d in pending:
+        shutil.rmtree(d, ignore_errors=True)
+        if not os.path.exists(d):
+            removed.append(d)
     return removed
+
+
+def browser_gone(pid: int, user_data_dir: str, port: int):
+    """A ``gone`` predicate for ``remove_unheld_clone_dirs``."""
+    def check() -> bool:
+        return not process_is_running(pid=pid) and not browser_processes(user_data_dir=user_data_dir, port=port)
+    return check
