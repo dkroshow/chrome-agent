@@ -260,6 +260,8 @@ def spawn_supervisor(
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # Outlives the launching command, like the browser it supervises.
+        start_new_session=True,
     )
 
 

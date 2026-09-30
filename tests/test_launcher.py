@@ -8,6 +8,7 @@ takes port_override instead of port, and registers instances.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -251,3 +252,74 @@ async def test_cleanup_preserves_active_dirs(tmp_path):
     finally:
         os.kill(result.pid, signal.SIGTERM)
         await asyncio.sleep(0.5)
+
+
+def test_launched_browser_outlives_its_launchers_process_group(tmp_path):
+    """Catches a browser tied to the caller's process group. A harness that
+    kills a finished command's whole group (Codex does) would take the browser
+    down with it, so a long-lived browser would restart, and take the front,
+    on every call.
+    """
+    import subprocess
+    import sys
+    import time
+
+    registry_path = str(tmp_path / "registry.json")
+    code = (
+        "import asyncio\n"
+        "from chrome_agent.launcher import launch_browser\n"
+        f"info = asyncio.run(launch_browser(port_override={LAUNCH_PORT}, headless=True,"
+        f" pin_to_desktop=False, registry_path={registry_path!r}))\n"
+        "print(info.pid, info.user_data_dir, flush=True)\n"
+    )
+    launcher = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    pid, user_data_dir = launcher.stdout.readline().split()
+    launcher.wait(timeout=60)
+    try:
+        # What the harness does once the command has returned.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(launcher.pid, signal.SIGKILL)
+        time.sleep(1)
+        assert check_cdp_port(port=LAUNCH_PORT).listening, "the browser died with its launcher's process group"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(int(pid), signal.SIGTERM)
+        time.sleep(0.5)
+        shutil.rmtree(user_data_dir, ignore_errors=True)
+
+
+def test_supervisor_runs_in_its_own_session(tmp_path):
+    """The supervisor holds focus emulation for a background-only browser and
+    retires closed instances; catches it sharing the caller's process group,
+    which a harness can kill once the launch command returns.
+    """
+    from chrome_agent.supervisor import spawn_supervisor
+
+    proc = spawn_supervisor(port=1, name="nobody-01", registry_path=str(tmp_path / "registry.json"),
+                            draw_border=False)
+    try:
+        assert os.getpgid(proc.pid) != os.getpgid(0)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_cleanup_keeps_a_fresh_untracked_session_dir(tmp_path):
+    """A temp profile a concurrent launch just created, before Chrome wrote its
+    SingletonLock and before registration, must survive a cleanup sweep."""
+    import time as _time
+    reg_path = str(tmp_path / "registry.json")
+    fresh = os.path.join(_SESSION_ROOT, "session-fresh-test")
+    stale = os.path.join(_SESSION_ROOT, "session-stale-test2")
+    os.makedirs(fresh, exist_ok=True)
+    os.makedirs(stale, exist_ok=True)
+    old = _time.time() - 3600
+    os.utime(stale, (old, old))
+    try:
+        cleanup_sessions(registry_path=reg_path)
+        assert os.path.isdir(fresh)
+        assert not os.path.exists(stale)
+    finally:
+        shutil.rmtree(fresh, ignore_errors=True)
+        shutil.rmtree(stale, ignore_errors=True)

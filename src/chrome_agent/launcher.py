@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 from .connection import check_cdp_port
 from .registry import REGISTRY_PATH, InstanceInfo, allocate_port, register, cleanup
@@ -24,6 +25,8 @@ from .utils import browser_gone, browser_processes, chrome_main_pids, code_sign_
 logger = logging.getLogger(__name__)
 
 _SESSION_ROOT = "/tmp/chrome-agent"
+# Untracked session dirs younger than this are never swept (see cleanup_sessions).
+_FRESH_SESSION_SECONDS = 120
 
 
 class BrowserNotFoundError(Exception):
@@ -247,7 +250,8 @@ async def _launch_browser(
     # profile files past the supervisor's removal window). With the pid-OR-port
     # liveness check and the SingletonLock pid check, this only removes
     # genuinely-gone browsers, and it frees their names/ports for reuse.
-    cleanup_sessions(registry_path=registry_path)
+    # Pruning happens under the port lock below, so it cannot run while another
+    # launch is between creating its session directory and registering it.
 
     # A persistent profile runs one browser at a time. If a live instance of
     # ours already has it, hand that back (the caller asked for "a browser on
@@ -279,6 +283,7 @@ async def _launch_browser(
     # readiness poll sees the winner's listener, and two instance names end up
     # routing to one browser -- for persistent profiles, to the wrong account.
     async with _async_flock(port_lock_path(_resolve_path(registry_path))):
+        cleanup_sessions(registry_path=registry_path)
         # Phase 2: Allocate port
         if port_override is not None:
             port = port_override
@@ -360,11 +365,14 @@ async def _launch_browser(
         # "before" set while its clone looks new.
         mains_before = chrome_main_pids()
         clones_before = code_sign_clone_snapshot()
+        # Its own session: the browser outlives the caller, including a
+        # harness that kills a finished command's whole process group.
         process = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
             stderr=stderr_file,
             env=env,
+            start_new_session=True,
         )
         process.stderr = stderr_file
         # Capture the process's start-time identity token immediately, while the
@@ -476,9 +484,17 @@ def cleanup_sessions(registry_path: str | None = None) -> list[str]:
                 continue
             if session_dir in tracked_dirs:
                 continue
-
             lock_file = os.path.join(session_dir, "SingletonLock")
             if not os.path.exists(lock_file) and not os.path.islink(lock_file):
+                # No lock yet can mean a launch still starting: Chrome has not
+                # written its SingletonLock and the registry entry does not
+                # exist yet. The CLI's cleanup command runs outside the launch
+                # lock, so age is the guard that covers it.
+                try:
+                    if time.time() - os.stat(session_dir).st_mtime < _FRESH_SESSION_SECONDS:
+                        continue
+                except OSError:
+                    continue
                 logger.info("Removing orphaned session directory: %s", session_dir)
                 shutil.rmtree(session_dir, ignore_errors=True)
             else:

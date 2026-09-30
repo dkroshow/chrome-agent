@@ -406,8 +406,13 @@ def test_sweep_honors_default_registry_from_isolated_invocation(tmp_path, sessio
         pid=os.getpid(), port=_free_port(), user_data_dir=str(tracked_dir),
     )
 
-    # A dir tracked by NO registry, also lock-less: a genuine orphan
+    # A dir tracked by NO registry, also lock-less: a genuine orphan. Aged past
+    # the freshness window, since a lock-less dir that is seconds old may be a
+    # launch still starting and is deliberately left alone.
     orphan_dir = _make_session_dir(session_root, "session-orphan")  # no lock
+    import time as _time
+    aged = _time.time() - 3600
+    os.utime(orphan_dir, (aged, aged))
 
     isolated_reg = str(tmp_path / "isolated-registry.json")
     cleanup_sessions(registry_path=isolated_reg)
